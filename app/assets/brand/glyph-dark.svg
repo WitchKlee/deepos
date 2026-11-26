@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <defs>
+    <linearGradient id="tail" x1="26" y1="31" x2="74" y2="81" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#818CF8"/><stop offset="0.55" stop-color="#60A5FA"/><stop offset="1" stop-color="#22D3EE"/></linearGradient>
+    <linearGradient id="fin" x1="31" y1="34" x2="67" y2="56" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#E0E7FF"/><stop offset="1" stop-color="#93C5FD"/></linearGradient>
+    <linearGradient id="belly" x1="49" y1="46" x2="69" y2="78" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#67E8F9"/><stop offset="1" stop-color="#6366F1"/></linearGradient>
+    <linearGradient id="bubble" x1="68" y1="26" x2="85" y2="43" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#67E8F9"/><stop offset="1" stop-color="#A5B4FC"/></linearGradient>
+  </defs>
+  <path id="body" d="M37.500,37.500 C46.240,32.560 51.760,32.560 60.500,37.500 C69.240,42.440 72.000,46.880 72.000,56.000 C72.000,65.120 69.240,69.560 60.500,74.500 C51.760,79.440 46.240,79.440 37.500,74.500 C28.760,69.560 26.000,65.120 26.000,56.000 C26.000,46.880 28.760,42.440 37.500,37.500 Z" fill="url(#tail)"/>
+  <path id="fin-layer" d="M39.750,38.750 C46.688,34.812 51.312,34.812 58.250,38.750 C65.188,42.688 65.188,45.438 58.250,49.750 C51.312,54.062 46.688,54.062 39.750,49.750 C32.812,45.438 32.812,42.688 39.750,38.750 Z" fill="url(#fin)"/>
+  <path id="belly-layer" d="M49.000,67.250 C49.000,59.188 51.438,55.163 58.750,51.150 C66.062,47.137 68.500,48.387 68.500,56.150 C68.500,63.913 66.062,67.938 58.750,72.250 C51.438,76.562 49.000,75.312 49.000,67.250 Z" fill="url(#belly)"/>
+  <path id="bubble-layer" d="M76.500,26.300 C81.029,26.300 84.700,29.971 84.700,34.500 C84.700,39.029 81.029,42.700 76.500,42.700 C71.971,42.700 68.300,39.029 68.300,34.500 C68.300,29.971 71.971,26.300 76.500,26.300 Z" fill="url(#bubble)"/>
+</svg>

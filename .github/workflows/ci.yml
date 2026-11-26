@@ -1,0 +1,40 @@
+name: DeepOS Android CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  dart-and-flutter:
+    name: Analyze & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Analyze & test dsh_client
+        working-directory: packages/dsh_client
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+
+      - name: Analyze & test dsh_remote
+        working-directory: packages/dsh_remote
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+
+      - name: Analyze Flutter app
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze lib/
