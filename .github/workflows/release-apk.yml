@@ -1,0 +1,163 @@
+name: Build & Release DeepOS APK (arm64)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.4.0-deepos.1; leave empty to use v<version_name>-<run_number>)'
+        required: false
+        default: ''
+      version_name:
+        description: 'App version name (e.g. 1.4.0)'
+        required: false
+        default: '1.4.0'
+      publish_release:
+        description: 'Create/update a GitHub Release with the APK'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-arm64-apk:
+    name: Build arm64 Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install runtime build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd xz-utils gpgv
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache embedded Linux runtime downloads
+        uses: actions/cache@v4
+        with:
+          path: runtime/.cache
+          key: runtime-cache-arm64-${{ hashFiles('runtime/build-runtime.sh', 'runtime/locks/**', 'runtime/patches/pins.json') }}
+          restore-keys: |
+            runtime-cache-arm64-
+
+      - name: Build embedded arm64-v8a PRoot Linux/DSH runtime
+        run: bash runtime/build-runtime.sh arm64-v8a
+
+      - name: Configure release signing (optional secrets)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "${KEYSTORE_B64:-}" ]]; then
+            echo "$KEYSTORE_B64" | base64 -d > app/android/release.keystore
+            printf 'storeFile=release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "$KEYSTORE_PASS" "$KEY_ALIAS" "$KEY_PASS" > app/android/key.properties
+            echo "Configured release keystore signing."
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret configured; falling back to default debug signing."
+          fi
+
+      - name: Resolve version & build number
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+            VER="${VER%%-*}"
+          else
+            VER="${{ inputs.version_name }}"
+            TAG="${{ inputs.tag }}"
+            if [[ -z "$TAG" ]]; then
+              TAG="v${VER}-deepos.${GITHUB_RUN_NUMBER}"
+            fi
+          fi
+          BUILD_NUM=$(python3 tooling/build_number.py)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "build_num=$BUILD_NUM" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG version=$VER build_num=$BUILD_NUM"
+
+      - name: Flutter pub get & analyze
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze lib/
+
+      - name: Build arm64 Release APK
+        working-directory: app
+        env:
+          DSH_MAVEN_MIRRORS: '0'
+        run: |
+          flutter build apk --release --flavor arm64 --target-platform android-arm64 \
+            --build-number "${{ steps.ver.outputs.build_num }}" \
+            --build-name "${{ steps.ver.outputs.version }}" \
+            --dart-define="DSH_APP_VERSION=${{ steps.ver.outputs.version }}+${{ steps.ver.outputs.build_num }}" \
+            --android-skip-build-dependency-validation
+
+      - name: Verify APK JNI & package metadata
+        run: |
+          APK="app/build/app/outputs/flutter-apk/app-arm64-release.apk"
+          python3 tooling/check_apk_jni.py "$APK"
+          mkdir -p dist
+          OUT="dist/DeepOS-${{ steps.ver.outputs.version }}-arm64.apk"
+          cp "$APK" "$OUT"
+          (cd dist && sha256sum "$(basename "$OUT")" > SHA256SUMS)
+          ls -lh dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload APK build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepOS-${{ steps.ver.outputs.version }}-arm64
+          path: dist/
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          VER="${{ steps.ver.outputs.version }}"
+          BUILD_NUM="${{ steps.ver.outputs.build_num }}"
+          APK="dist/DeepOS-${VER}-arm64.apk"
+          printf '%s\n' \
+            "DeepOS Android 专属精简定制版（基于 [ccch1mneyyy/dsh-Go](https://github.com/ccch1mneyyy/dsh-Go)，AGPL-3.0）。" \
+            "" \
+            "- **版本**：\`${VER}\`（build \`${BUILD_NUM}\`）" \
+            "- **包名**：\`io.github.witchklee.deepos\`" \
+            "- **架构**：\`arm64-v8a\`（内嵌 Ubuntu 24.04 + Node.js + DSH PRoot 运行时与端上语音模型）" \
+            "- **校验**：见附件 \`SHA256SUMS\`" > dist/RELEASE_NOTES.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" "$APK" dist/SHA256SUMS \
+              --title "DeepOS ${TAG} (arm64)" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi
