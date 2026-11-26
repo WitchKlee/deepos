@@ -1,4 +1,4 @@
-name: Build & Release DeepOS APK (arm64)
+name: Build & Release DeepOS APKs (sdk28 + sdk36)
 
 on:
   push:
@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.4.0-deepos.1; leave empty to use v<version_name>-<run_number>)'
+        description: 'Release tag (e.g. v2.0.0; leave empty to use v<version_name>-<run_number>)'
         required: false
         default: ''
       version_name:
-        description: 'App version name (e.g. 1.4.0)'
+        description: 'App version name (e.g. 2.0.0)'
         required: false
-        default: '1.4.0'
+        default: '2.0.0'
       publish_release:
-        description: 'Create/update a GitHub Release with the APK'
+        description: 'Create/update a GitHub Release with both sdk28 and sdk36 APKs'
         type: boolean
         required: false
         default: true
@@ -24,19 +24,14 @@ permissions:
   contents: write
 
 jobs:
-  build-arm64-apk:
-    name: Build arm64 Release APK
+  build-release-apks:
+    name: Build sdk28 & sdk36 Release APKs
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install runtime build prerequisites
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq zstd xz-utils gpgv
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -56,16 +51,13 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Cache embedded Linux runtime downloads
-        uses: actions/cache@v4
-        with:
-          path: runtime/.cache
-          key: runtime-cache-arm64-${{ hashFiles('runtime/build-runtime.sh', 'runtime/locks/**', 'runtime/patches/pins.json') }}
-          restore-keys: |
-            runtime-cache-arm64-
-
-      - name: Build embedded arm64-v8a PRoot Linux/DSH runtime
-        run: bash runtime/build-runtime.sh arm64-v8a
+      - name: Install Android NDK & CMake
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1"
 
       - name: Configure release signing (optional secrets)
         env:
@@ -103,38 +95,42 @@ jobs:
           echo "build_num=$BUILD_NUM" >> "$GITHUB_OUTPUT"
           echo "Resolved: tag=$TAG version=$VER build_num=$BUILD_NUM"
 
-      - name: Flutter pub get & analyze
-        working-directory: app
+      - name: Run verification checks
         run: |
-          flutter pub get
-          flutter analyze lib/
+          node tooling/test-gateway.mjs a0610-b2-sessionops ccmem.test a0610-b2-state-shapes
+          (cd packages/cc_gateway_client && dart pub get && dart analyze && dart test)
+          python3 app/tool/l10n_merge.py --check
+          (cd app && flutter pub get && flutter analyze lib/ && flutter test)
 
-      - name: Build arm64 Release APK
+      - name: Build sdk28 & sdk36 Release APKs
         working-directory: app
         env:
           DSH_MAVEN_MIRRORS: '0'
         run: |
-          flutter build apk --release --flavor arm64 --target-platform android-arm64 \
+          flutter build apk --release --flavor sdk28 --target-platform android-arm64 \
             --build-number "${{ steps.ver.outputs.build_num }}" \
             --build-name "${{ steps.ver.outputs.version }}" \
-            --dart-define="DSH_APP_VERSION=${{ steps.ver.outputs.version }}+${{ steps.ver.outputs.build_num }}" \
+            --android-skip-build-dependency-validation
+          flutter build apk --release --flavor sdk36 --target-platform android-arm64 \
+            --build-number "${{ steps.ver.outputs.build_num }}" \
+            --build-name "${{ steps.ver.outputs.version }}" \
             --android-skip-build-dependency-validation
 
-      - name: Verify APK JNI & package metadata
+      - name: Verify APK native libs & compute checksums
         run: |
-          APK="app/build/app/outputs/flutter-apk/app-arm64-release.apk"
-          python3 tooling/check_apk_jni.py "$APK"
+          VER="${{ steps.ver.outputs.version }}"
           mkdir -p dist
-          OUT="dist/DeepOS-${{ steps.ver.outputs.version }}-arm64.apk"
-          cp "$APK" "$OUT"
-          (cd dist && sha256sum "$(basename "$OUT")" > SHA256SUMS)
+          cp app/build/app/outputs/flutter-apk/app-sdk28-release.apk "dist/DeepOS-${VER}-sdk28.apk"
+          cp app/build/app/outputs/flutter-apk/app-sdk36-release.apk "dist/DeepOS-${VER}-sdk36.apk"
+          python3 tooling/check_apk_jni.py "dist/DeepOS-${VER}-sdk28.apk" "dist/DeepOS-${VER}-sdk36.apk"
+          (cd dist && sha256sum "DeepOS-${VER}-sdk28.apk" "DeepOS-${VER}-sdk36.apk" > SHA256SUMS)
           ls -lh dist/
           cat dist/SHA256SUMS
 
-      - name: Upload APK build artifact
+      - name: Upload Release APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: DeepOS-${{ steps.ver.outputs.version }}-arm64
+          name: DeepOS-${{ steps.ver.outputs.version }}-APKs
           path: dist/
           retention-days: 30
 
@@ -146,18 +142,22 @@ jobs:
           TAG="${{ steps.ver.outputs.tag }}"
           VER="${{ steps.ver.outputs.version }}"
           BUILD_NUM="${{ steps.ver.outputs.build_num }}"
-          APK="dist/DeepOS-${VER}-arm64.apk"
+          APK28="dist/DeepOS-${VER}-sdk28.apk"
+          APK36="dist/DeepOS-${VER}-sdk36.apk"
           printf '%s\n' \
-            "DeepOS Android 专属精简定制版（基于 [ccch1mneyyy/dsh-Go](https://github.com/ccch1mneyyy/dsh-Go)，AGPL-3.0）。" \
+            "DeepOS v2 — Android 原生免 PRoot Claude Code 端侧开发工作站（融合 [dsh-Go](https://github.com/ccch1mneyyy/dsh-Go) 与 [cccodroid](https://github.com/greyoak111/cccodroid)，AGPL-3.0）。" \
             "" \
             "- **版本**：\`${VER}\`（build \`${BUILD_NUM}\`）" \
-            "- **包名**：\`io.github.witchklee.deepos\`" \
-            "- **架构**：\`arm64-v8a\`（内嵌 Ubuntu 24.04 + Node.js + DSH PRoot 运行时与端上语音模型）" \
+            "- **包名**：\`app.deepos\`（10 字符等长包名，原生免 PRoot 执行 Termux 工具包）" \
+            "- **安装包选择**：" \
+            "  - \`DeepOS-${VER}-sdk28.apk\`：常规版（targetSdk 28，适用大多数机型）" \
+            "  - \`DeepOS-${VER}-sdk36.apk\`：新系统版（targetSdk 36，若系统提示不兼容旧版 SDK 请装此包）" \
+            "- **首次启动**：按需下载模块化工具包及官方原版 Claude Code（APK 不含专有二进制）" \
             "- **校验**：见附件 \`SHA256SUMS\`" > dist/RELEASE_NOTES.md
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$APK" dist/SHA256SUMS --clobber
+            gh release upload "$TAG" "$APK28" "$APK36" dist/SHA256SUMS --clobber
           else
-            gh release create "$TAG" "$APK" dist/SHA256SUMS \
-              --title "DeepOS ${TAG} (arm64)" \
+            gh release create "$TAG" "$APK28" "$APK36" dist/SHA256SUMS \
+              --title "DeepOS ${TAG} (sdk28 + sdk36)" \
               --notes-file dist/RELEASE_NOTES.md
           fi

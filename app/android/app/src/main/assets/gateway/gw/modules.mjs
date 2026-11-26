@@ -1,0 +1,524 @@
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { LAST_LANG, PREFIX, log, tr, tz } from "./config.mjs";
+import { killTree } from "./claude.mjs";
+import { NEXT, readBody, sendJson } from "./http.mjs";
+import { termEnv } from "./terminal.mjs";
+import {
+  COMP_RUN_DIR, bootId, breathe, compBaseDeps, compJobsDeps, compNeeds, compRecords, compRun,
+  devkitIdentity, markChild, rmTreeBatched, sha256File, unmarkChild, uptimeMs,
+} from "./components.mjs";
+import { archiveProblem, parseTarListing } from "./archive-check.mjs";
+
+// ── 模块化工具包（0.3.9 起）──────────────────────────────────────────
+// 工具包按 devkit.json 的 modules 拆成基础块 + 若干模块（+ 自动算出的共享层），同一份 Termux 快照一起发布。
+//   · $PREFIX/libexec/devkit/modules.json 在 = 模块化工具包（基础块装进来时一并写入）；不在就是旧的整包，面板照旧显示一整行。
+//   · 某块已装 ⇔ 它的目录（modules.json 的 dir，如 libexec/devkit/modules/build）里有 MANIFEST 和 .ok。
+//   · 不另设计数：一个文件还有没有人用，由其余已装块的 FILES + 已装组件的 needs + pkg 装的包现算。
+//   · 加装 / 卸载单个块在这里做（同一快照内）；首次安装、换快照由 Java（Installer / Updater）整体换 usr/。
+// 装的流程照组件：下载 → 核 gz 的 sha256（modules.json 里的，随基础块一起装进来、当时已核过来源）
+//   → 解到暂存区 → 按 MANIFEST 逐个核 → 搬进 $PREFIX → first-run → 写 .ok。任何一步失败 $PREFIX 不动（.ok 不写）。
+const DK = PREFIX ? path.join(PREFIX, "libexec/devkit") : "";
+const STAGE = PREFIX ? path.join(path.dirname(PREFIX), "devkit-stage") : "";
+const MOD_JOBS = new Map();          // id → { phase, done, total, via, error, child, cancelled, finished, queue }
+let modStarting = false;             // 覆盖 await rmTreeBatched 窗口，防止并发 modStart/modRemove 绕过 MOD_JOBS 忙检查
+const DEVKIT_MIRROR = "https://dl.cccodroid.net/devkit/";
+
+/** modules.json 同 uid 可改：dir 只认 $PREFIX 内的普通相对路径 —— 卸载时会对 dirOf(m) 整个 rmSync（196-供应链.3） */
+const modDirOk = (d) => typeof d === "string" && d.length > 0 && !d.includes("\0") && !d.includes("\\") &&
+  !path.isAbsolute(d) && d.split("/").every((p) => p && p !== "." && p !== "..");
+/** FILES 里的一行同理，不安全的行不参与删除（196-供应链.3） */
+const safeRel = (r) => typeof r === "string" && r.length > 0 && !r.includes("\0") && !r.includes("\\") &&
+  !path.isAbsolute(r) && r.split("/").every((p) => p && p !== "." && p !== "..");
+
+export function modulesInfo() {
+  if (!DK) return null;
+  let j;
+  try { j = JSON.parse(fs.readFileSync(path.join(DK, "modules.json"), "utf8")); } catch { return null; }
+  // 0.6.9 审计 198 P1-19：modules.json 是合法 JSON 但形状不对（modules 不是数组、里面混了 null
+  // 或缺 id / dir 的条目）时，坏条目会一路带到 envFactsKey 的定时器里抛 TypeError，
+  // 网关崩了重启、重启再崩。这里只放行能用的条目；连模块表都不是数组就当没有模块表。
+  if (!j || typeof j !== "object" || Array.isArray(j) || !Array.isArray(j.modules)) {
+    log("[mod] modules.json 形状不对（modules 不是数组），按整包工具包处理");
+    return null;
+  }
+  const n = j.modules.length;
+  j.modules = j.modules.filter((m) => m && typeof m === "object" && typeof m.id === "string" && m.id && modDirOk(m.dir));
+  if (j.modules.length !== n) log(`[mod] modules.json 里有 ${n - j.modules.length} 个坏条目，已忽略`);
+  return j;
+}
+const blockOf = (mj, id) => (mj.modules || []).find((m) => m.id === id) || null;
+const dirOf = (m) => path.join(PREFIX, m.dir);
+export function modInstalled(mj, id) {
+  const m = blockOf(mj, id);
+  if (!m) return false;
+  if (m.kind === "base") return true;
+  return fs.existsSync(path.join(dirOf(m), ".ok")) && fs.existsSync(path.join(dirOf(m), "MANIFEST"));
+}
+const readLines = (f) => { try { return fs.readFileSync(f, "utf8").split("\n").filter(Boolean); } catch { return []; } };
+/** 一块放进 $PREFIX 的全部路径（文件 + 软链），相对 $PREFIX */
+const filesOf = (m) => readLines(path.join(dirOf(m), "FILES")).filter(safeRel);
+
+/** 组件要用、但所在模块没装的底座包 → 要先装的模块（共享层报给用它的模块）。整包工具包或不知道依赖时返回 [] */
+export function modulesMissingFor(baseDeps) {
+  const mj = modulesInfo();
+  if (!mj || !Array.isArray(baseDeps)) return [];
+  const need = new Set(baseDeps.map((d) => (typeof d === "string" ? d : d.name)));
+  const out = new Map();
+  for (const m of mj.modules || []) {
+    if (modInstalled(mj, m.id) || !(m.packages || []).some((p) => need.has(p.name))) continue;
+    // 共享层不单独装：提示用它的模块里最小的那个
+    for (const id of m.kind === "shared" ? (m.users || []).filter((u) => !modInstalled(mj, u)).sort((x, y) => (blockOf(mj, x) || {}).installed - (blockOf(mj, y) || {}).installed).slice(0, 1) : [m.id]) {
+      const b = blockOf(mj, id);
+      if (b) out.set(id, { id, name: b.name });
+    }
+  }
+  return [...out.values()];
+}
+
+/** 依赖闭包里还没装的块（按依赖顺序，最后是 id 自己） */
+function missingChain(mj, id, out = [], seen = new Set()) {
+  if (seen.has(id)) return out;
+  seen.add(id);
+  const m = blockOf(mj, id);
+  if (!m) throw new Error(tz("没有这个模块：{id}", { id }));
+  for (const d of m.deps || []) missingChain(mj, d, out, seen);
+  if (!modInstalled(mj, id)) out.push(id);
+  return out;
+}
+
+/** pkg 装的包：{ 名字: 记录 }（files/pkg/installed.json，在工具包目录之外） */
+function pkgRecords() {
+  try { return JSON.parse(fs.readFileSync(path.join(path.dirname(PREFIX), "pkg", "installed.json"), "utf8")).pkgs || {}; } catch { return {}; }
+}
+/** 谁在用这一块：已装的模块（deps 含它）、已装的组件（依赖的底座包落在这块里、别的已装块又没有）、
+ *  pkg 装的包（Depends 里有这块独有的包，#104 05-002）。组件判断不了依赖的（旧记录 + 没有索引）也算在用：宁可拦下，不能删坏 */
+function modDependents(mj, id, ignoreMods = null) {
+  const mods = (mj.modules || []).filter((m) => m.id !== id && !(ignoreMods && ignoreMods.has(m.id)) && modInstalled(mj, m.id) && (m.deps || []).includes(id) && m.kind !== "shared").map((m) => m.id);
+  const mine = new Set((blockOf(mj, id).packages || []).map((p) => p.name));
+  for (const m of mj.modules || []) if (m.id !== id && !(ignoreMods && ignoreMods.has(m.id)) && modInstalled(mj, m.id)) for (const p of m.packages || []) mine.delete(p.name);
+  const comps = [];
+  for (const [cid, rec] of compRecords()) {
+    const deps = compBaseDeps(cid, rec.sha256, rec);
+    if (!deps ? mine.size > 0 : deps.some((n) => mine.has(n))) comps.push(cid);
+  }
+  // 正在下载 / 校验的组件也算：装完要用这块的底座包（#134）
+  for (const j of compJobsDeps()) if (!comps.includes(j.id) && j.baseDeps.some((n) => mine.has(n))) comps.push(j.id);
+  const pkgs = [];
+  for (const [name, r] of Object.entries(pkgRecords())) {
+    // Depends 是 Debian 格式：「a (>= 1), b | c」—— 备选里有一个落在这块就算（保守）
+    const names = String((r && r.deps) || "").split(/[,|]/).map((x) => x.trim().split(/[\s(:]/)[0]).filter(Boolean);
+    if (names.some((n) => mine.has(n))) pkgs.push(name);
+  }
+  return { modules: mods, components: comps, pkgs };
+}
+
+function modList() {
+  if (!PREFIX) return { supported: false };
+  const mj = modulesInfo();
+  if (!mj) return { supported: true, modular: false };
+  const dk = devkitIdentity() || {};
+  const items = (mj.modules || []).map((m) => {
+    const job = MOD_JOBS.get(m.id), inst = modInstalled(mj, m.id);
+    const dep = inst ? modDependents(mj, m.id) : { modules: [], components: [], pkgs: [] };
+    // 一条链共用一个 job：只有正在装的那一块显示进度，已经装好的那块照旧显示「已安装」（0.6.9 审计 195-I.5）
+    const cur = job && !job.finished && job.current === m.id;
+    return {
+      id: m.id, kind: m.kind, required: !!m.required, name: m.name, desc: m.desc, uses: m.uses || [],
+      deps: m.deps || [], users: m.users || [], commands: m.commands || [], key: m.key || [],
+      packages: (m.packages || []).map((p) => `${p.name} ${p.version}`),
+      download: (m.gz && m.gz.bytes) || 0, installed: m.installed || 0, files: m.files || 0,
+      state: cur ? job.phase : inst ? "ok" : job && job.error && job.current === m.id ? "error" : "absent",
+      progress: cur ? { phase: job.phase, done: job.done, total: job.total, via: job.via || "", current: job.current } : null,
+      error: job && job.error && job.current === m.id ? tr(LAST_LANG, job.error) : "",
+      usedBy: dep,
+      sha256: (m.gz && m.gz.sha256) || "",
+    };
+  });
+  let free = null;   // 扩展页的存储条要「剩余」
+  try { const st = fs.statfsSync(path.dirname(PREFIX)); free = st.bavail * st.bsize; } catch {}
+  return { supported: true, modular: true, snapshot: mj.snapshot, release: dk.base || "", items, free };
+}
+
+// ── 装 ────────────────────────────────────────────────────────────────
+async function modInstall(id) { return (await modInstallJob(id)).r; }
+/** 核对记录的「修补」（reconcile.mjs）：已装的这块也重装一遍 —— modRunInstall 本来就原地覆盖、.ok 最后写。
+ *  done 在任务结束时给出错误信息（成功是 ""），只给网关内部等，不出 HTTP */
+export async function modRepair(id) {
+  const { r, job } = await modInstallJob(id, { repair: true });
+  return { ...r, done: job ? job.promise.then(() => job.error || (job.cancelled ? tz("已取消") : "")) : Promise.resolve("") };
+}
+/** 返回 { r: 给界面的结果, job: 真起了安装任务才有 } */
+async function modInstallJob(id, { repair = false } = {}) {
+  const x = await modStart(id, repair);
+  return x.job ? x : { r: x, job: null };
+}
+async function modStart(id, repair) {
+  if (!PREFIX) return { ok: false, message: "only available in cccodroid" };
+  const mj = modulesInfo();
+  if (!mj) return { ok: false, message: tz("当前是整包工具包，没有模块可装") };
+  const m = blockOf(mj, id);
+  if (!m) return { ok: false, message: tz("没有这个模块：{id}", { id }) };
+  if (modStarting) return { ok: false, message: tz("另一个模块正在装，等它结束再试") };
+  for (const j of MOD_JOBS.values()) if (!j.finished) return { ok: false, message: tz("另一个模块正在装，等它结束再试") };
+  let chain;
+  try { chain = missingChain(mj, id); } catch (e) { return { ok: false, message: e.message }; }
+  if (repair && !chain.includes(id)) chain.push(id);
+  if (!chain.length) return { ok: true, already: true };
+  const dk = devkitIdentity() || {};
+  if (!dk.base) return { ok: false, message: tz("工具包是从本地文件装的，不知道该去哪个 Release 下载模块。请先在设置里更新一次工具包") };
+  // 先校验所有块的下载信息，再加占位锁清理暂存树，避免 await 间隙并发 modStart 双装踩踏 $PREFIX
+  for (const c of chain) {
+    const b = blockOf(mj, c);
+    if (!b.gz || !Number.isFinite(b.gz.bytes) || typeof b.gz.sha256 !== "string" || !b.gz.sha256) return { ok: false, message: tz("这个模块的下载信息不完整，先更新一次工具包") };
+  }
+  modStarting = true;
+  try {
+    // 空间：压缩包 + 解开后的大小（暂存区与目标在同一分区，搬进去是换名不占双份），再留 10%。
+    // 上次失败留下的、大小对得上的压缩包已经占着空间，不再重复要；上次失败留下的解包树先清掉，
+    // 不然重试先被自己留下的残留挡住（0.6.9 审计 #186 / 195-I.2）
+    for (const c of chain) {
+      try { await rmTreeBatched(path.join(STAGE, c)); } catch {}
+    }
+    const need = modSpaceNeed(mj, chain);
+    try { const st = fs.statfsSync(path.dirname(PREFIX)); const free = st.bavail * st.bsize; if (free < need) return { ok: false, message: tz("存储空间不够：需要约 {need} MB，只剩 {free} MB", { need: Math.ceil(need / 1048576), free: Math.floor(free / 1048576) }) }; } catch {}
+    const job = { phase: "downloading", done: 0, total: 0, queue: chain, current: chain[0], finished: false };
+    for (const c of chain) MOD_JOBS.set(c, job);
+    job.promise = (async () => {
+      try {
+        for (const c of chain) { job.current = c; await modRunInstall(mj, blockOf(mj, c), dk.base, job); }
+        log(`[mod] 已装：${chain.join(" → ")}`);
+      } catch (e) {
+      job.error = e.message === "cancelled" ? "" : e.message;
+      // 失败的解包树（可能几百 MB）以前一直留在 devkit-stage，只有下次重装才会被开头那句清掉；
+      // 用户不再重试就没有入口删。这里当场清掉。压缩包按组件安装的做法留着，重试时大小对得上就不重下（196-供应链.2）
+      try { if (job.stageTree) await rmTreeBatched(job.stageTree); } catch {}
+      log(`[mod] ${job.current} 安装失败：${e.message}`);
+    } finally {
+      job.finished = true; job.child = null;
+      // 成功的块不留 job（状态看 .ok）；失败的那块留着 error 给面板看
+      for (const c of chain) if (!job.error || c !== job.current) MOD_JOBS.delete(c);
+    }
+    })();
+    return { r: { ok: true, chain }, job };
+  } finally {
+    modStarting = false;
+  }
+}
+
+/** 模块安装 / 卸载心跳：与 components.mjs 同目录同字段，看门狗（GatewayService.installingBeat）据此放宽探活时限，
+ *  避免大模块（如 haskell 9k+ 文件、build+共享层 16k+ 文件）在搬移或清理时被 SIGKILL */
+function modHeart(id) {
+  const mark = COMP_RUN_DIR ? path.join(COMP_RUN_DIR, `mod-${id}.installing`) : "";
+  if (mark) try { fs.mkdirSync(COMP_RUN_DIR, { recursive: true }); } catch {}
+  return {
+    beat(moved, phase = "move") {
+      if (!mark) return;
+      try { fs.writeFileSync(mark, JSON.stringify({ id: "mod-" + id, phase, moved, at: uptimeMs(), gw: process.pid, boot: bootId() })); } catch {}
+    },
+    clear() { if (mark) try { fs.rmSync(mark, { force: true }); } catch {} },
+  };
+}
+
+/** 列出 tar.gz 条目并挂到 job.child：扫描几百 MB 模块包时允许取消，崩溃后也可被 reapComponentRuns 清理 */
+function modTarList(job, gz) {
+  return new Promise((resolve, reject) => {
+    const cmd = path.join(PREFIX, "bin", "tar"), args = ["-tzv", "--quoting-style=c", "-f", gz];
+    const child = spawn(cmd, args, { env: termEnv(), stdio: ["ignore", "pipe", "pipe"], detached: true });
+    job.child = child;
+    const mark = markChild(child, cmd, args);
+    const chunks = [];
+    let bytes = 0, err = "", overflow = false;
+    child.stdout.on("data", (d) => {
+      bytes += d.length;
+      if (bytes > (256 << 20)) { overflow = true; killTree(child); return; }
+      chunks.push(d);
+    });
+    child.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
+    let settled = false;
+    child.on("error", (e) => {
+      if (settled) return; settled = true;
+      job.child = null; unmarkChild(mark); reject(e);
+    });
+    // 监听 close 而非 exit：exit 触发时 stdout 管道末尾分片可能尚未排空，会导致尾部路径逃逸校验漏检
+    child.on("close", (code) => {
+      if (settled) return; settled = true;
+      job.child = null; unmarkChild(mark);
+      if (job.cancelled) return reject(new Error("cancelled"));
+      if (overflow) return reject(new Error("tar listing too large"));
+      if (code !== 0) return reject(new Error(err.trim() || `tar exit ${code}`));
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+  });
+}
+
+/** Guile 编译缓存（.go）必须严格比源码（.scm）新，否则 gdb / guile 启动陷入重编译死循环（同 Installer.java:670） */
+async function touchGuileGo(beat = () => {}) {
+  const libGuile = path.join(PREFIX, "lib", "guile");
+  if (!fs.existsSync(libGuile)) return;
+  let maxScm = 0;
+  const scanScm = async (dir) => {
+    let ds; try { ds = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of ds) {
+      const p = path.join(dir, d.name);
+      if (d.isDirectory()) { await breathe(); await scanScm(p); }
+      else if (d.name.endsWith(".scm")) {
+        try { const mt = fs.statSync(p).mtimeMs; if (mt > maxScm) maxScm = mt; } catch {}
+      }
+    }
+  };
+  await scanScm(path.join(PREFIX, "share", "guile"));
+  await scanScm(libGuile);
+  const stamp = new Date(Math.max(Date.now(), maxScm + 1000));
+  let n = 0;
+  const touchWalk = async (dir) => {
+    let ds; try { ds = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of ds) {
+      const p = path.join(dir, d.name);
+      if (d.isDirectory()) { await breathe(); await touchWalk(p); }
+      else if (d.name.endsWith(".go")) {
+        try { fs.utimesSync(p, stamp, stamp); } catch {}
+        n++;
+        await breathe();
+        if ((n & 255) === 0) beat(n, "switch");
+      }
+    }
+  };
+  await touchWalk(libGuile);
+}
+
+/** 这条链还要多少空间（压缩包 + 解开后的大小，留 10%）：暂存区里大小对得上的压缩包不再重复要（0.6.9 审计 #186） */
+export function modSpaceNeed(mj, chain) {
+  let need = 0;
+  for (const c of chain) {
+    const b = blockOf(mj, c);
+    const bytes = b && b.gz && Number(b.gz.bytes) || 0;
+    let reuse = 0;
+    try {
+      if (b.gz && b.gz.sha256 && fs.statSync(path.join(STAGE, `${b.id}-${b.gz.sha256.slice(0, 12)}.tar.gz`)).size === b.gz.bytes) reuse = b.gz.bytes;
+    } catch {}
+    need += bytes - reuse + ((b && b.installed) || 0);
+  }
+  return need * 1.1;
+}
+
+/** 读模块包里的 MANIFEST：空/缺失不是「没有文件要校验」，路径也必须在包内（0.6.9 审计 200-10-08） */
+export function modManifest(tree, dir) {
+  const man = readLines(path.join(tree, "usr", dir, "MANIFEST"));
+  if (!man.length) throw new Error(tz("模块包里缺文件清单（MANIFEST），为安全起见不安装"));
+  return man.map((line) => {
+    const i = line.indexOf(" "), j = line.indexOf(" ", i + 1), rel = line.slice(j + 1);
+    // 包内 MANIFEST 同 uid 可改，别让 ../ 或绝对路径把核对带出暂存区
+    if (i < 0 || j < 0 || !rel || path.isAbsolute(rel) || rel.split("/").includes("..")) throw new Error(tz("模块包的文件清单里有不合法的路径：{file}", { file: rel.slice(0, 160) }));
+    return { h: line.slice(0, i), n: Number(line.slice(i + 1, j)), rel };
+  });
+}
+
+let modMirrorFirst = false;
+async function modRunInstall(mj, m, base, job) {
+  fs.mkdirSync(STAGE, { recursive: true });
+  const gz = path.join(STAGE, `${m.id}-${m.gz.sha256.slice(0, 12)}.tar.gz`), tree = path.join(STAGE, m.id);
+  job.stageTree = tree;      // 失败时由 modInstall 的 catch 清掉（196-供应链.2）
+  if (fs.existsSync(gz)) {
+    job.phase = "verifying"; job.done = 0; job.total = m.gz.bytes;
+    if ((await sha256File(gz, job)) !== m.gz.sha256) fs.rmSync(gz, { force: true });
+  }
+  if (!fs.existsSync(gz)) {
+    const part = gz + ".part";
+    job.phase = "downloading"; job.done = 0; job.total = m.gz.bytes;
+    const tick = setInterval(() => { try { job.done = fs.statSync(part).size; } catch {} }, 500);
+    try {
+      // GitHub Release 与 dl.cccodroid.net 镜像逐字节同一份，内容按 modules.json 里的 sha256 把关
+      const gh = base + m.gz.file, mirror = DEVKIT_MIRROR + base.replace(/\/$/, "").split("/").pop() + "/" + m.gz.file;
+      const srcs = modMirrorFirst ? [mirror, gh] : [gh, mirror];
+      let lastErr;
+      for (let i = 0; i < 4 && !job.cancelled; i++) {
+        const url = srcs[i % 2];
+        job.via = url === gh ? "GitHub" : "dl.cccodroid.net";
+        try {
+          await compRun(job, path.join(PREFIX, "bin", "curl"), ["-fL", "-sS", "-C", "-", "--retry", "2", "--connect-timeout", "15", "--speed-limit", "10000", "--speed-time", "45", "-o", part, url]);
+          lastErr = null; modMirrorFirst = url !== gh; break;
+        } catch (e) { lastErr = e; if (job.cancelled) break; log(`[mod] ${m.id} 从 ${job.via} 下载中断：${e.message}`); }
+      }
+      if (job.cancelled) throw new Error("cancelled");
+      let have = 0; try { have = fs.statSync(part).size; } catch {}
+      if (lastErr && have !== m.gz.bytes) throw lastErr;
+    } finally { clearInterval(tick); }
+    job.phase = "verifying"; job.done = 0; job.total = m.gz.bytes;
+    if ((await sha256File(part, job)) !== m.gz.sha256) { fs.rmSync(part, { force: true }); throw new Error(tz("下载的文件校验不符（已删除，重试会重新下载）")); }
+    fs.renameSync(part, gz);
+  }
+  if (job.cancelled) throw new Error("cancelled");
+  // 解包阶段没有可靠的字节进度：不画永远 0% 的条（0.6.9 审计 195-I.8），解完按清单给总量
+  job.phase = "verifying"; job.done = 0; job.total = 0;
+  await rmTreeBatched(tree);
+  fs.mkdirSync(tree, { recursive: true });
+  // 解之前按目录查（同组件包）：MANIFEST 解完才核，经包内软链或 .. 写到暂存区外面的条目那时已经落地了（11-03 审查 L-8）
+  try {
+    const list = await modTarList(job, gz);
+    const bad = archiveProblem(parseTarListing(list));
+    if (bad) throw new Error(tz("这个压缩包里有条目会写到包外面（{p}），为安全起见不解开", { p: String(bad.name).slice(0, 200) }));
+    await compRun(job, path.join(PREFIX, "bin", "tar"), ["-xzf", gz, "-C", tree]);
+  }
+  catch (e) { if (!job.cancelled) fs.rmSync(gz, { force: true }); throw e; }
+  const man = modManifest(tree, m.dir);
+  job.total = man.reduce((a, e) => a + (Number.isFinite(e.n) ? e.n : 0), 0);   // 按清单字节算，installed 含链接等到不了头
+  for (const e of man) {
+    await breathe();
+    if (job.cancelled) throw new Error("cancelled");
+    const f = path.join(tree, "usr", e.rel);
+    let st; try { st = fs.statSync(f); } catch { throw new Error(tz("模块包缺文件：{file}", { file: e.rel })); }
+    if (st.size !== e.n || (await sha256File(f, null, st.size)) !== e.h) throw new Error(tz("模块包里的文件校验不符：{file}", { file: e.rel }));
+    job.done += st.size;
+  }
+  // 搬进去：.ok 最后写，中途被打断就是「没装」，重装会覆盖、卸载按 FILES 删
+  job.phase = "installing";
+  const hasGuile = m.id === "lib-guile" || man.some((e) => e.rel.startsWith("lib/guile/") || e.rel.startsWith("share/guile/")) || fs.existsSync(path.join(tree, "usr", "lib", "guile"));
+  const heart = modHeart(m.id);
+  heart.beat(0, "switch");
+  try {
+    fs.rmSync(path.join(dirOf(m), ".ok"), { force: true });
+    const skipped = await modMoveIn(path.join(tree, "usr"), "", [], heart.beat);
+    if (skipped.length) log(`[mod] ${m.id}：${skipped.length} 个路径和已有目录冲突，没放：${skipped.slice(0, 5).join(", ")}`);
+    const fr = path.join(dirOf(m), "first-run.sh");
+    if (fs.existsSync(fr)) {
+      try { await compRun(job, path.join(PREFIX, "bin", "sh"), [fr]); }
+      catch (e) {
+        if (job.cancelled) throw new Error("cancelled");
+        // first-run 失败不能写 .ok：以前照样写，模块显示已装但没有配置，也没有重试入口（0.6.9 审计 200-14-06）。
+        // 不写 .ok 就是「没装」，重装会再跑一遍
+        throw new Error(tz("模块「{name}」的首次配置没跑完（{err}），再装一次会重试", { name: (m.name && m.name.zh) || m.id, err: String(e.message).slice(0, 200) }));
+      }
+    }
+    if (hasGuile) await touchGuileGo(heart.beat);
+    fs.writeFileSync(path.join(dirOf(m), ".ok"), JSON.stringify({ sha256: m.gz.sha256, at: Date.now() }) + "\n");
+    await rmTreeBatched(tree, (n) => heart.beat(n, "switch"));
+    fs.rmSync(gz, { force: true });
+  } finally {
+    heart.clear();
+  }
+}
+
+/** 暂存区的 usr/ 逐个搬进 $PREFIX。已有同名文件直接换掉：同一快照里共用的小包内容一样；pkg 先装过的以模块为准。
+ *  分批让出事件循环并写看门狗心跳，避免大模块搬移时事件循环阻塞被杀 */
+async function modMoveIn(stageUsr, rel = "", skipped = [], beat = () => {}, state = { n: 0 }) {
+  for (const d of fs.readdirSync(path.join(stageUsr, rel), { withFileTypes: true })) {
+    const r = rel ? rel + "/" + d.name : d.name;
+    const src = path.join(stageUsr, r), dst = path.join(PREFIX, r);
+    let st = null; try { st = fs.lstatSync(dst); } catch {}
+    if (d.isDirectory()) {
+      if (st && !st.isDirectory()) { skipped.push(r); continue; }
+      if (!st) fs.mkdirSync(dst, { recursive: true });
+      await breathe();
+      await modMoveIn(stageUsr, r, skipped, beat, state);
+      continue;
+    }
+    if (st && st.isDirectory()) { skipped.push(r); continue; }
+    fs.renameSync(src, dst);
+    state.n++;
+    await breathe();
+    if ((state.n & 255) === 0) { beat(state.n, "move"); await new Promise((r2) => setImmediate(r2)); }
+  }
+  return skipped;
+}
+
+function modCancel(id) {
+  const job = MOD_JOBS.get(id);
+  if (!job || job.finished) return { ok: false, message: "not running" };
+  if (job.phase === "installing" || job.phase === "removing") return { ok: false, message: tz("正在放进工具包，这一步不能中断") };
+  job.cancelled = true;
+  if (job.child) killTree(job.child);
+  return { ok: true };
+}
+
+// ── 卸 ────────────────────────────────────────────────────────────────
+/** 卸 id；它依赖的共享层没有别的已装模块、组件或 pkg 在用时一并卸掉 */
+async function modRemove(id) {
+  if (!PREFIX) return { ok: false, message: "only available in cccodroid" };
+  const mj = modulesInfo();
+  if (!mj) return { ok: false, message: tz("当前是整包工具包，没有模块可卸") };
+  const m = blockOf(mj, id);
+  if (!m) return { ok: false, message: tz("没有这个模块：{id}", { id }) };
+  if (m.required) return { ok: false, message: tz("基础模块不能卸载") };
+  if (m.kind === "shared") return { ok: false, message: tz("共享运行库跟着用它的模块走，不能单独卸载") };
+  if (modStarting) return { ok: false, message: tz("有模块正在安装，等它结束再试") };
+  for (const j of MOD_JOBS.values()) if (!j.finished) return { ok: false, message: tz("有模块正在安装，等它结束再试") };
+  if (!modInstalled(mj, id)) return { ok: false, message: "not installed" };
+  const dep = modDependents(mj, id);
+  if (dep.modules.length || dep.components.length || dep.pkgs.length) return { ok: false, usedBy: dep, message: tz("{names} 要用它，先卸载那些", { names: [...dep.modules, ...dep.components, ...dep.pkgs.map((n) => "pkg " + n)].join("、") }) };
+  const gone = [id];
+  const ignore = new Set([id]);
+  for (const l of (m.deps || []).map((d) => blockOf(mj, d)).filter((b) => b && b.kind === "shared" && modInstalled(mj, b.id))) {
+    const stillMod = (mj.modules || []).some((o) => o.id !== id && o.kind === "module" && (o.deps || []).includes(l.id) && modInstalled(mj, o.id));
+    if (stillMod) continue;
+    // 共享层可能被已装组件或 pkg 单独依赖（如卸 android 时仍有组件/pkg 用 lib-openjdk-21）：有依赖就保留共享层
+    const ldep = modDependents(mj, l.id, ignore);
+    if (ldep.components.length || ldep.pkgs.length) {
+      log(`[mod] 保留共享运行库 ${l.id}（仍被 ${[...ldep.components, ...ldep.pkgs.map((x) => "pkg " + x)].join("、")} 使用）`);
+      continue;
+    }
+    gone.push(l.id);
+  }
+  // 还要留下的：其余已装块的路径 + 组件要用的 + pkg 装的
+  const keep = new Set();
+  for (const o of mj.modules || []) if (!gone.includes(o.id) && modInstalled(mj, o.id)) for (const r of filesOf(o)) keep.add(r);
+  for (const [cid, rec] of compRecords()) for (const r of compNeeds(cid, rec)) keep.add(r);
+  for (const p of Object.values(pkgRecords())) for (const r of (p && p.files) || []) keep.add(r);
+  const removal = { phase: "removing", current: id, finished: false };
+  MOD_JOBS.set(id, removal);
+  const heart = modHeart(id);
+  heart.beat(0, "switch");
+  let n = 0;
+  try {
+    for (const g of gone) {
+      const b = blockOf(mj, g), files = filesOf(b);
+      if (!files.length) { log(`[mod] ${g} 没有 FILES，跳过删除`); continue; }
+      fs.rmSync(path.join(dirOf(b), ".ok"), { force: true });         // 先摘 .ok：删到一半被打断就是「没装」
+      const dirs = new Set();
+      for (const r of files) {
+        if (keep.has(r)) continue;
+        try { fs.unlinkSync(path.join(PREFIX, r)); n++; } catch {}
+        for (let d = path.dirname(r); d && d !== "."; d = path.dirname(d)) dirs.add(d);
+        // Python 运行时生成的 .pyc 不在清单里，跟着 .py 删
+        if (r.endsWith(".py")) {
+          const pc = path.join(PREFIX, path.dirname(r), "__pycache__"), stem = path.basename(r, ".py") + ".";
+          try { for (const f of fs.readdirSync(pc)) if (f.startsWith(stem) && f.endsWith(".pyc")) fs.unlinkSync(path.join(pc, f)); } catch {}
+          dirs.add(path.join(path.dirname(r), "__pycache__"));
+        }
+        await breathe();
+        if ((n & 255) === 0) { heart.beat(n, "move"); await new Promise((r2) => setImmediate(r2)); }
+      }
+      await rmTreeBatched(dirOf(b), (k) => heart.beat(n + k, "switch"));
+      const sortedDirs = [...dirs].sort((a, c) => c.length - a.length);
+      for (let i = 0; i < sortedDirs.length; i++) {
+        try { fs.rmdirSync(path.join(PREFIX, sortedDirs[i])); } catch {}
+        if ((i & 255) === 0) { await breathe(); heart.beat(n, "switch"); }
+      }
+    }
+  } finally {
+    heart.clear();
+    removal.finished = true;
+    for (const g of gone) if (MOD_JOBS.get(g) === removal || MOD_JOBS.get(g)?.finished) MOD_JOBS.delete(g);
+    if (MOD_JOBS.get(id) === removal) MOD_JOBS.delete(id);
+  }
+  log(`[mod] 已卸载 ${gone.join("、")}（删 ${n} 个路径）`);
+  return { ok: true, removed: gone };
+}
+
+// ── 路由：/api/devkit/modules ──
+export async function routeModules(req, res, u, p) {
+  if (p !== "/api/devkit/modules" && !p.startsWith("/api/devkit/modules/")) return NEXT;
+  if (req.method === "GET" && p === "/api/devkit/modules") return sendJson(res, 200, modList());
+  if (req.method !== "POST") return sendJson(res, 405, { error: "method" });
+  let body = {}; try { body = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const id = String(body.id || "");
+  if (!/^[a-z0-9-]{1,40}$/.test(id)) return sendJson(res, 400, { ok: false, message: "bad id" });
+  if (p === "/api/devkit/modules/install") return sendJson(res, 200, await modInstall(id));
+  if (p === "/api/devkit/modules/cancel") return sendJson(res, 200, modCancel(id));
+  if (p === "/api/devkit/modules/remove") return sendJson(res, 200, await modRemove(id));
+  return sendJson(res, 404, { error: "not found" });
+}
+
+// 只给测试用（和 components.mjs 的 _compForTest 一个口径）
+export const _modForTest = { modInstall, modRemove, modCancel, MOD_JOBS };

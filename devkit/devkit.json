@@ -1,0 +1,776 @@
+{
+  "_doc": "开发工具包清单。全部取自 Termux 官方仓库（构建配方公开：github.com/termux/termux-packages），由 devkit.mjs 校验哈希、改前缀、打成一个 tar。",
+  "groups": {
+    "core": [
+      "bash",
+      "coreutils",
+      "grep",
+      "sed",
+      "gawk",
+      "findutils",
+      "diffutils",
+      "less",
+      "procps",
+      "file",
+      "tar",
+      "gzip",
+      "xz-utils",
+      "zstd",
+      "unzip",
+      "zip",
+      "curl",
+      "ca-certificates",
+      "openssl",
+      "openssl-tool",
+      "debianutils",
+      "which",
+      "patch",
+      "ed",
+      "dos2unix",
+      "lsof",
+      "nano",
+      "inetutils",
+      "net-tools",
+      "tree"
+    ],
+    "build": [
+      "clang",
+      "lld",
+      "binutils",
+      "nasm",
+      "make",
+      "cmake",
+      "ninja",
+      "pkg-config",
+      "gdb",
+      "strace",
+      "patchelf",
+      "bison",
+      "flex",
+      "gperf",
+      "libtool",
+      "ccache"
+    ],
+    "autotools": [
+      "autoconf",
+      "automake",
+      "m4",
+      "perl"
+    ],
+    "vcs": [
+      "git",
+      "openssh"
+    ],
+    "lang": [
+      "python",
+      "nodejs",
+      "npm",
+      "python-pip"
+    ],
+    "android": [
+      "openjdk-21",
+      "aapt2",
+      "d8",
+      "apksigner"
+    ],
+    "adb": [
+      "android-tools"
+    ],
+    "cli": [
+      "ripgrep",
+      "fd",
+      "bat",
+      "git-delta",
+      "helix",
+      "yq",
+      "jq",
+      "sqlite",
+      "mandoc",
+      "bash-completion",
+      "fontconfig-utils",
+      "tmux",
+      "git-lfs"
+    ],
+    "graphics": [
+      "mesa",
+      "libglvnd",
+      "libdrm",
+      "libwayland",
+      "libxfixes",
+      "libxshmfence",
+      "libxxf86vm",
+      "vulkan-loader",
+      "vulkan-loader-generic"
+    ],
+    "media": [
+      "ffmpeg"
+    ],
+    "extra": [
+      "typst",
+      "duckdb",
+      "imagemagick"
+    ],
+    "claude": [
+      "glibc"
+    ],
+    "go": [
+      "golang",
+      "gopls",
+      "goimports",
+      "gofumpt",
+      "gotestsum",
+      "govulncheck",
+      "golangci-lint",
+      "delve"
+    ],
+    "node": [
+      "pnpm",
+      "yarn",
+      "bun",
+      "deno"
+    ],
+    "rust": [
+      "rust",
+      "rust-analyzer"
+    ],
+    "python-tools": [
+      "uv",
+      "ruff"
+    ],
+    "jvm": [
+      "kotlin",
+      "scala",
+      "groovy",
+      "maven"
+    ],
+    "php": [
+      "php",
+      "composer"
+    ],
+    "beam": [
+      "erlang",
+      "elixir"
+    ],
+    "lisp": [
+      "sbcl",
+      "ecl",
+      "racket",
+      "chicken",
+      "guile",
+      "janet",
+      "picolisp"
+    ],
+    "native": [
+      "nim",
+      "crystal",
+      "ldc"
+    ],
+    "legacy": [
+      "tcl",
+      "gforth",
+      "gnucobol",
+      "swi-prolog"
+    ],
+    "haskell": [
+      "ghc",
+      "cabal-install"
+    ]
+  },
+  "exclude": [
+    "termux-am",
+    "termux-am-socket"
+  ],
+  "base": [
+    "core",
+    "build",
+    "vcs",
+    "lang",
+    "android",
+    "cli",
+    "graphics",
+    "media",
+    "claude",
+    "adb"
+  ],
+  "_doc_modules": "modules：模块化工具包的划分（devkit.mjs modules）。base 必装；其余随装随卸。闭包里被两个以上模块共用、又不小于 sharedMinMB 的包自动提成共享层（不单独显示，没人用时跟着卸）；更小的共用包各模块各带一份，装卸靠共享文件计数。uses 是 App 里用到它的功能，面板照着显示。key：主要命令（卡片和给 Claude 的本机实况先列它们；完整命令表打包时从 usr/bin 收集）",
+  "sharedMinMB": 50,
+  "modules": {
+    "base": {
+      "required": true,
+      "groups": [
+        "core",
+        "vcs",
+        "lang",
+        "claude",
+        "adb"
+      ],
+      "name": {
+        "zh": "基础",
+        "en": "Base"
+      },
+      "desc": {
+        "zh": "命令行基本工具、git/ssh、Python、Node.js、adb，以及运行 Claude Code 需要的 glibc。必装。",
+        "en": "Core command-line tools, git/ssh, Python, Node.js, adb, and the glibc that Claude Code runs on. Required."
+      },
+      "uses": [
+        "claude",
+        "git",
+        "terminal",
+        "shizuku"
+      ],
+      "key": [
+        "bash",
+        "git",
+        "ssh",
+        "curl",
+        "python3",
+        "pip",
+        "node",
+        "npm",
+        "adb"
+      ]
+    },
+    "cli": {
+      "groups": [
+        "cli"
+      ],
+      "name": {
+        "zh": "命令行增强",
+        "en": "CLI extras"
+      },
+      "desc": {
+        "zh": "rg、fd、bat、delta、helix、jq/yq、sqlite、man、tmux、git-lfs、fc-list：Claude 搜代码、看差异更快，终端和字体排查也更顺手。",
+        "en": "rg, fd, bat, delta, helix, jq/yq, sqlite, man, tmux, git-lfs, fc-list: faster code search/diffs, terminal multiplexer, Git LFS and font lookup."
+      },
+      "uses": [
+        "search"
+      ],
+      "key": [
+        "rg",
+        "fd",
+        "bat",
+        "delta",
+        "hx",
+        "jq",
+        "yq",
+        "sqlite3",
+        "man",
+        "tmux",
+        "git-lfs",
+        "fc-list",
+        "fc-match"
+      ]
+    },
+    "build": {
+      "groups": [
+        "build"
+      ],
+      "name": {
+        "zh": "C/C++ 构建",
+        "en": "C/C++ build"
+      },
+      "desc": {
+        "zh": "clang、lld、binutils、nasm、cmake、ninja、make、bison、flex、gperf、libtool、ccache、gdb、strace、patchelf：在手机上编译、调试原生程序。",
+        "en": "clang, lld, binutils, nasm, cmake, ninja, make, bison, flex, gperf, libtool, ccache, gdb, strace, patchelf: compile and debug native programs on the phone."
+      },
+      "uses": [
+        "native-build"
+      ],
+      "key": [
+        "cc",
+        "clang",
+        "clang++",
+        "lld",
+        "as",
+        "nasm",
+        "make",
+        "cmake",
+        "ninja",
+        "pkg-config",
+        "bison",
+        "flex",
+        "gperf",
+        "libtool",
+        "ccache",
+        "gdb",
+        "strace",
+        "patchelf"
+      ]
+    },
+    "autotools": {
+      "groups": [
+        "autotools"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Autotools 与 Perl",
+        "en": "Autotools & Perl"
+      },
+      "desc": {
+        "zh": "autoconf、automake、m4、perl（约 75 MB）：从源码跑 ./configure / autoreconf 编译经典 GNU 项目时按需安装。",
+        "en": "autoconf, automake, m4 and perl (~75 MB): install on demand when building classic GNU/autotools projects from source."
+      },
+      "uses": [
+        "native-build"
+      ],
+      "key": [
+        "autoconf",
+        "automake",
+        "autoreconf",
+        "m4",
+        "perl"
+      ]
+    },
+    "android": {
+      "groups": [
+        "android"
+      ],
+      "name": {
+        "zh": "安卓打包",
+        "en": "Android build"
+      },
+      "desc": {
+        "zh": "JDK 21、aapt2、d8、apksigner：在手机上打 APK。",
+        "en": "JDK 21, aapt2, d8, apksigner: build APKs on the phone."
+      },
+      "uses": [
+        "apk"
+      ],
+      "key": [
+        "java",
+        "javac",
+        "jar",
+        "keytool",
+        "aapt2",
+        "d8",
+        "apksigner"
+      ]
+    },
+    "graphics": {
+      "groups": [
+        "graphics"
+      ],
+      "name": {
+        "zh": "GPU 图形",
+        "en": "GPU graphics"
+      },
+      "desc": {
+        "zh": "Mesa、Vulkan 加载器等公共图形库，Blender、浏览器等 GPU 组件要用。",
+        "en": "Mesa, the Vulkan loader and other shared graphics libraries used by GPU components such as Blender and the browser."
+      },
+      "uses": [
+        "gpu-components"
+      ],
+      "key": []
+    },
+    "media": {
+      "groups": [
+        "media"
+      ],
+      "name": {
+        "zh": "音视频",
+        "en": "Audio & video"
+      },
+      "desc": {
+        "zh": "ffmpeg（带 MediaCodec 硬件编码）：转码、剪辑、抽帧。",
+        "en": "ffmpeg (with MediaCodec hardware encoding): transcode, cut, extract frames."
+      },
+      "uses": [
+        "media"
+      ],
+      "key": [
+        "ffmpeg",
+        "ffprobe"
+      ]
+    },
+    "extra": {
+      "groups": [
+        "extra"
+      ],
+      "name": {
+        "zh": "文档与数据",
+        "en": "Docs & data"
+      },
+      "desc": {
+        "zh": "typst、duckdb、imagemagick：排版出 PDF、分析表格数据、处理图片。",
+        "en": "typst, duckdb, imagemagick: typeset PDFs, analyse tabular data, process images."
+      },
+      "uses": [
+        "docs"
+      ],
+      "key": [
+        "typst",
+        "duckdb",
+        "magick"
+      ]
+    },
+    "go": {
+      "groups": [
+        "go"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Go 语言",
+        "en": "Go"
+      },
+      "desc": {
+        "zh": "Go 工具链、gopls、goimports/gofumpt、gotestsum、govulncheck、golangci-lint、dlv：写、查、测、调 Go 程序。",
+        "en": "Go toolchain, gopls, goimports/gofumpt, gotestsum, govulncheck, golangci-lint and dlv: write, inspect, test and debug Go."
+      },
+      "uses": [],
+      "key": [
+        "go",
+        "gofmt",
+        "gopls",
+        "goimports",
+        "gofumpt",
+        "gotestsum",
+        "govulncheck",
+        "golangci-lint",
+        "dlv"
+      ]
+    },
+    "node": {
+      "groups": [
+        "node"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Node.js 生态",
+        "en": "Node.js ecosystem"
+      },
+      "desc": {
+        "zh": "pnpm、yarn、bun、deno：npm 之外再装几个包管理器和运行时。",
+        "en": "pnpm, yarn, bun and deno: package managers and runtimes beyond the bundled npm."
+      },
+      "uses": [],
+      "key": [
+        "pnpm",
+        "yarn",
+        "bun",
+        "deno"
+      ]
+    },
+    "rust": {
+      "groups": [
+        "rust"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Rust 语言",
+        "en": "Rust"
+      },
+      "desc": {
+        "zh": "rustc、cargo、clippy、rustfmt、rust-analyzer（会复用 C/C++ 构建的 clang/lld/libllvm 共享层）：写、查、编 Rust 项目。",
+        "en": "rustc, cargo, clippy, rustfmt and rust-analyzer (reuses the clang/lld/libllvm shared layer with C/C++ build)."
+      },
+      "uses": [],
+      "key": [
+        "rustc",
+        "cargo",
+        "rust-analyzer",
+        "rustfmt",
+        "cargo-clippy"
+      ]
+    },
+    "python-tools": {
+      "groups": [
+        "python-tools"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Python 现代工具",
+        "en": "Python tools"
+      },
+      "desc": {
+        "zh": "uv、ruff（约 54 MB）：极速 Python 包管理、虚拟环境与代码检查格式化，不改动基础 Python/pip。",
+        "en": "uv and ruff (~54 MB): fast Python package/venv manager and linter/formatter without altering base Python/pip."
+      },
+      "uses": [],
+      "key": [
+        "uv",
+        "uvx",
+        "ruff"
+      ]
+    },
+    "jvm": {
+      "groups": [
+        "jvm"
+      ],
+      "full": false,
+      "name": {
+        "zh": "JVM 语言",
+        "en": "JVM languages"
+      },
+      "desc": {
+        "zh": "Kotlin、Scala、Groovy、Maven（约 340 MB）：复用工具包自带的 JDK 21，在手机上写 JVM 语言。",
+        "en": "Kotlin, Scala, Groovy and Maven (~340 MB): write JVM languages on the phone, reusing the bundled JDK 21."
+      },
+      "uses": [],
+      "key": [
+        "kotlin",
+        "kotlinc",
+        "scala",
+        "scalac",
+        "groovy",
+        "groovyc",
+        "mvn"
+      ]
+    },
+    "php": {
+      "groups": [
+        "php"
+      ],
+      "full": false,
+      "name": {
+        "zh": "PHP",
+        "en": "PHP"
+      },
+      "desc": {
+        "zh": "PHP 8.5 与 Composer（约 82 MB）：命令行脚本、WordPress 等传统 Web 栈开发。",
+        "en": "PHP 8.5 and Composer (~82 MB): CLI scripting and classic web stacks like WordPress."
+      },
+      "uses": [],
+      "key": [
+        "php",
+        "composer"
+      ]
+    },
+    "beam": {
+      "groups": [
+        "beam"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Erlang 与 Elixir",
+        "en": "Erlang & Elixir"
+      },
+      "desc": {
+        "zh": "Erlang/OTP 29 与 Elixir 1.20（约 135 MB）：高并发分布式系统、Phoenix Web 框架。",
+        "en": "Erlang/OTP 29 and Elixir 1.20 (~135 MB): concurrent distributed systems and the Phoenix web framework."
+      },
+      "uses": [],
+      "key": [
+        "erl",
+        "escript",
+        "elixir",
+        "iex",
+        "mix"
+      ]
+    },
+    "lisp": {
+      "groups": [
+        "lisp"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Lisp 与 Scheme",
+        "en": "Lisp & Scheme"
+      },
+      "desc": {
+        "zh": "SBCL、ECL、Racket、Chicken、Guile、Janet、PicoLisp（约 170 MB）：Common Lisp、Scheme 与各 Lisp 方言，一次装齐。",
+        "en": "SBCL, ECL, Racket, Chicken, Guile, Janet and PicoLisp (~170 MB): Common Lisp, Scheme and other Lisp dialects in one install."
+      },
+      "uses": [],
+      "key": [
+        "sbcl",
+        "ecl",
+        "racket",
+        "raco",
+        "csi",
+        "guile",
+        "janet",
+        "pil"
+      ]
+    },
+    "native": {
+      "groups": [
+        "native"
+      ],
+      "full": false,
+      "name": {
+        "zh": "现代编译型语言",
+        "en": "Native-compiled languages"
+      },
+      "desc": {
+        "zh": "Nim、Crystal、D（ldc，约 193 MB）：三个现代编译型语言，都复用 C/C++ 构建的 clang/lld。",
+        "en": "Nim, Crystal and D (ldc, ~193 MB): three modern compiled languages, all reusing the clang/lld from C/C++ build."
+      },
+      "uses": [
+        "native-build"
+      ],
+      "key": [
+        "nim",
+        "crystal",
+        "ldc2"
+      ]
+    },
+    "legacy": {
+      "groups": [
+        "legacy"
+      ],
+      "full": false,
+      "name": {
+        "zh": "复古语言",
+        "en": "Retro languages"
+      },
+      "desc": {
+        "zh": "Tcl、Gforth（Forth）、GnuCOBOL、SWI-Prolog（约 37 MB）：老牌与复古语言。",
+        "en": "Tcl, Gforth (Forth), GnuCOBOL and SWI-Prolog (~37 MB): veteran and retro languages."
+      },
+      "uses": [],
+      "key": [
+        "tclsh",
+        "gforth",
+        "cobc",
+        "swipl"
+      ]
+    },
+    "haskell": {
+      "groups": [
+        "haskell"
+      ],
+      "full": false,
+      "name": {
+        "zh": "Haskell",
+        "en": "Haskell"
+      },
+      "desc": {
+        "zh": "GHC 9.12 与 cabal（装后约 2.8 GB）：按需安装，写函数式程序。",
+        "en": "GHC 9.12 and cabal (~2.8 GB installed): install on demand for functional programming."
+      },
+      "uses": [],
+      "key": [
+        "ghc",
+        "ghci",
+        "runghc",
+        "cabal"
+      ]
+    }
+  },
+  "external": [
+    {
+      "id": "android-platform-36",
+      "why": "aapt2/javac/d8 编译 APK 需要的平台存根 android.jar",
+      "url": "https://dl.google.com/android/repository/platform-36_r02.zip",
+      "sha1": "2c1a80dd4d9f7d0e6dd336ec603d9b5c55a6f576",
+      "size": 65878410,
+      "license": "android-sdk-license（Google Android SDK 许可协议：不可再分发，须用户在设备上自行下载并同意）",
+      "extract": "android-36/android.jar",
+      "dest": "usr/share/android-sdk/platforms/android-36/android.jar"
+    }
+  ],
+  "repos": [
+    {
+      "name": "main",
+      "base": "https://packages-cf.termux.dev/apt/termux-main/",
+      "dist": "stable",
+      "component": "main",
+      "arch": "aarch64",
+      "mirrors": [
+        "https://packages.termux.dev/apt/termux-main/",
+        "https://grimler.se/termux/termux-main/"
+      ]
+    },
+    {
+      "name": "glibc",
+      "base": "https://packages-cf.termux.dev/apt/termux-glibc/",
+      "dist": "glibc",
+      "component": "stable",
+      "arch": "aarch64",
+      "mirrors": [
+        "https://packages.termux.dev/apt/termux-glibc/"
+      ]
+    }
+  ],
+  "drop": [
+    "usr/bin/termux-wake-lock",
+    "usr/bin/termux-wake-unlock",
+    "usr/bin/termux-open",
+    "usr/bin/termux-open-url",
+    "usr/bin/termux-reload-settings",
+    "usr/bin/termux-setup-storage",
+    "usr/bin/termux-reset",
+    "usr/bin/termux-backup",
+    "usr/bin/termux-restore",
+    "usr/bin/termux-change-repo",
+    "usr/bin/termux-setup-package-manager",
+    "usr/bin/termux-info"
+  ],
+  "stubs": {
+    "usr/bin/pkg": "# 正常情况下用不到这个文件：cccodroid 0.2.8 起 pkg / apt 由应用提供（PATH 最前的 app/pre）\nif [ -n \"$CCAPP_BIN\" ] && [ -f \"$CCAPP_BIN/pkg.mjs\" ]; then exec node \"$CCAPP_BIN/pkg.mjs\" \"$@\"; fi\necho \"pkg / apt 由 cccodroid 应用提供（0.2.8 起）：请把 cccodroid 更新到最新版。\" >&2\nexit 1",
+    "usr/bin/apt": "# 正常情况下用不到这个文件：cccodroid 0.2.8 起 pkg / apt 由应用提供（PATH 最前的 app/pre）\nif [ -n \"$CCAPP_BIN\" ] && [ -f \"$CCAPP_BIN/pkg.mjs\" ]; then exec node \"$CCAPP_BIN/pkg.mjs\" \"$@\"; fi\necho \"pkg / apt 由 cccodroid 应用提供（0.2.8 起）：请把 cccodroid 更新到最新版。\" >&2\nexit 1",
+    "usr/bin/apt-get": "# 正常情况下用不到这个文件：cccodroid 0.2.8 起 pkg / apt 由应用提供（PATH 最前的 app/pre）\nif [ -n \"$CCAPP_BIN\" ] && [ -f \"$CCAPP_BIN/pkg.mjs\" ]; then exec node \"$CCAPP_BIN/pkg.mjs\" \"$@\"; fi\necho \"pkg / apt 由 cccodroid 应用提供（0.2.8 起）：请把 cccodroid 更新到最新版。\" >&2\nexit 1",
+    "usr/bin/hx-grammar": "# 只装你要的那几个 tree-sitter 语法。\n#\n# 为什么不直接用 hx --grammar fetch：它会把 languages.toml 里列的全部 245 个语法都克隆下来\n# （实测跑了 70 个就 374MB），在手机上不现实。\n#\n# 这里从 hx 二进制里嵌着的 languages.toml 读出对应语法的 git 地址与 rev（helix 把这份表\n# 编进二进制，所以永远和装着的版本对得上），浅克隆那个 rev，放进 helix 的 sources 目录，\n# 再让 hx 自己编译 —— 实测 3 秒编好一个，产物在 ~/.config/helix/runtime/grammars/<名字>.so。\n#\n#   hx-grammar rust python lua        装这几个\n#   hx-grammar --list                 列出全部可用名字\n#   hx-grammar --list rust            只看名字里含 rust 的\n\nset -eu\n\nHX=$(command -v hx) || { echo \"找不到 hx\" >&2; exit 1; }\n# bin/hx 是设 HELIX_RUNTIME 的包装脚本，真正的二进制在 opt/helix/hx —— 挑那个嵌着语法表的\nfor c in \"$(readlink -f \"$HX\")\" $(grep -ao '/[^ \"]*/hx' \"$HX\" 2>/dev/null) \"${PREFIX:-/data/data/cc.codroid/files/usr}/opt/helix/hx\"; do\n  if [ -f \"$c\" ] && grep -aq '^\\[\\[grammar\\]\\]$' \"$c\" 2>/dev/null; then HX=\"$c\"; break; fi\ndone\ngrep -aq '^\\[\\[grammar\\]\\]$' \"$HX\" 2>/dev/null || { echo \"读不出 hx 里的语法表（$HX）\" >&2; exit 1; }\n\nDEST=\"$HOME/.config/helix/runtime/grammars\"\nSRC=\"$DEST/sources\"\n\ngrammar_field() {   # $1=语法名 $2=字段名（git / rev）\n  grep -a -A2 \"^name = \\\"$1\\\"\\$\" \"$HX\" 2>/dev/null | grep -a -m1 '^source = ' \\\n    | sed -n \"s/.*$2 = \\\"\\([^\\\"]*\\)\\\".*/\\1/p\"\n}\n\nif [ \"${1:---list}\" = \"--list\" ]; then\n  names=$(grep -a -A2 '^\\[\\[grammar\\]\\]$' \"$HX\" | sed -n 's/^name = \"\\(.*\\)\"$/\\1/p' | sort -u)\n  if [ $# -gt 1 ]; then printf '%s\\n' \"$names\" | grep -i -- \"$2\" || true; else printf '%s\\n' \"$names\"; fi\n  exit 0\nfi\n[ $# -gt 0 ] || { echo \"用法：hx-grammar <语法名…>，或 hx-grammar --list [关键字]\" >&2; exit 2; }\n\nmkdir -p \"$SRC\"\nnew=\"\"\nfor name in \"$@\"; do\n  url=$(grammar_field \"$name\" git)\n  rev=$(grammar_field \"$name\" rev)\n  if [ -z \"$url\" ]; then\n    echo \"✗ $name：语法表里没有它（hx-grammar --list 看可用的）\" >&2\n    continue\n  fi\n  d=\"$SRC/$name\"\n  if [ -f \"$d/src/parser.c\" ]; then\n    echo \"· $name 源码已在，跳过克隆\"\n  else\n    echo \"· $name ← $url\"\n    rm -rf \"$d\"\n    mkdir -p \"$d\"\n    git -C \"$d\" init -q\n    git -C \"$d\" remote add origin \"$url\"\n    if [ -n \"$rev\" ]; then\n      git -C \"$d\" fetch -q --depth 1 origin \"$rev\" || git -C \"$d\" fetch -q --depth 1 origin\n    else\n      git -C \"$d\" fetch -q --depth 1 origin\n    fi\n    git -C \"$d\" checkout -q FETCH_HEAD\n  fi\n  new=\"$new $name\"\ndone\n[ -n \"$new\" ] || { echo \"没有要装的\"; exit 0; }\n\necho \"· 编译（hx 会顺带报其余没拉下来的语法失败，忽略即可）\"\nhx --grammar build 2>&1 | grep -v -e 'Failed to read directory' -e 'grammars failed to build' -e '^Failure' || true\n\nrc=0\nfor name in $new; do\n  if [ -f \"$DEST/$name.so\" ]; then\n    echo \"✓ $name → $DEST/$name.so（$(du -h \"$DEST/$name.so\" | cut -f1)）\"\n  else\n    echo \"✗ $name 没编出来\" >&2\n    rc=1\n  fi\ndone\nexit $rc",
+    "usr/libexec/termux/command-not-found": "# 命令没找到（bash.bashrc 的 command_not_found_handle 调它）：模块化工具包（cccodroid 0.3.9 起）里，\n# 看看这个命令是不是在还没装的模块里，告诉用户去哪装。整包工具包没有 modules.json，就只报找不到\nu=$(cd \"$(dirname \"$0\")/../..\" && pwd)\nif [ -f \"$u/libexec/devkit/modules.json\" ] && [ -x \"$u/bin/node\" ]; then\n  \"$u/bin/node\" -e '\nconst [f, cmd] = process.argv.slice(1), u = require(\"path\").dirname(require(\"path\").dirname(require(\"path\").dirname(f)));\nconst mj = JSON.parse(require(\"fs\").readFileSync(f, \"utf8\"));\nconst m = (mj.modules || []).find((x) => x.kind === \"module\" && (x.commands || []).includes(cmd) && !require(\"fs\").existsSync(u + \"/\" + x.dir + \"/.ok\"));\nif (!m) process.exit(1);\n// 连同还没装的依赖（共享层）一起算\nconst ok = (x) => x.kind === \"base\" || require(\"fs\").existsSync(u + \"/\" + x.dir + \"/.ok\");\nconst mb = Math.round([m, ...(m.deps || []).map((d) => mj.modules.find((x) => x.id === d)).filter((x) => x && !ok(x))].reduce((s, x) => s + (x.installed || 0), 0) / 1048576);\nconsole.error(cmd + \"：在工具包的「\" + m.name.zh + \"」模块里，还没装。到 扩展 → 工具包模块 装上即可（约 \" + mb + \" MB）。\");\nconsole.error(cmd + \": part of the \\u201c\" + m.name.en + \"\\u201d toolkit module, which is not installed. Install it under Extensions \\u2192 Toolkit modules (about \" + mb + \" MB).\");\n' \"$u/libexec/devkit/modules.json\" \"$1\" && exit 127\nfi\necho \"$1: command not found\" >&2\nexit 127"
+  },
+  "fetch": {
+    "usr/lib/python3.14/ensurepip/_bundled/pip-26.2.2-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl",
+      "sha256": "fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
+      "why": "Termux 的 python 删了 ensurepip 自带的 wheel（指望 pkg 装 python-pip），没有它 python -m venv 建不出带 pip 的环境。版本须与 ensurepip/__init__.py 的 _PIP_VERSION 一致（devkit.mjs 构建时核对，对不上直接失败；python 升级后照报错换 wheel）"
+    }
+  },
+  "pip": {
+    "why": "Android 没有标准 /usr/share/zoneinfo 目录树，Python 的 zoneinfo.ZoneInfo 离线需要纯 Python tzdata 包（#208）",
+    "wheels": [
+      {
+        "url": "https://files.pythonhosted.org/packages/0a/66/9a06c2227fedfd4919f0eaaa8b94377d9730882a7e4f95823c9a331ab5e1/tzdata-2026.6-py2.py3-none-any.whl",
+        "sha256": "0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec"
+      }
+    ]
+  },
+  "_doc_fetch": "fetch：仓库之外的上游原件，按哈希核对后放进包里",
+  "_doc_drop": "drop：解包时丢掉的文件（Termux App 专属脚本）；stubs：替换成小脚本的命令（pkg/apt 转交应用自带的实现）",
+  "extraRepos": {
+    "x11": {
+      "name": "x11",
+      "base": "https://packages-cf.termux.dev/apt/termux-x11/",
+      "dist": "x11",
+      "component": "main",
+      "arch": "aarch64",
+      "mirrors": [
+        "https://packages.termux.dev/apt/termux-x11/"
+      ]
+    }
+  },
+  "components": {
+    "chromium": {
+      "_doc": "可选组件：无头 Chromium，给 Claude 打开网页、截图、跑页面 JS 用（不随工具包，用户在应用里手动装）",
+      "name": {
+        "zh": "浏览器组件（无头 Chromium）",
+        "en": "Browser component (headless Chromium)"
+      },
+      "desc": {
+        "zh": "让 Claude 打开网页：截图、导出 PDF、取渲染后的页面、用 puppeteer-core 操作网页，适合测试本机开发的网站。没有窗口，只在后台运行；你自己看网页用应用内浏览器即可，不需要装它。",
+        "en": "Lets Claude open web pages: screenshots, PDF export, rendered DOM, and scripted browsing with puppeteer-core — handy for testing sites you build here. It runs headless in the background; to browse yourself, the built-in browser is enough."
+      },
+      "repos": [
+        "x11"
+      ],
+      "roots": [
+        "chromium"
+      ],
+      "bin": [
+        "chromium-headless",
+        "chromium-browser"
+      ],
+      "exclude": [
+        "python-lxml"
+      ],
+      "_exclude": "python-lxml：只有 lv2 的 Python 小工具要它（lv2 ← lilv ← ffmpeg），postinst 还会现场 pip 装依赖 —— Chromium 用不上",
+      "files": {
+        "usr/bin/chromium-headless": {
+          "src": "components/chromium/chromium-headless",
+          "mode": "755"
+        },
+        "usr/share/cccodroid/components/chromium/skill/SKILL.md": {
+          "src": "components/chromium/SKILL.md"
+        }
+      },
+      "skill": "usr/share/cccodroid/components/chromium/skill",
+      "selftest": "chromium-headless --dump-dom 'data:text/html,<p id=ok>ok</p>'"
+    }
+  },
+  "_doc_adb": "adb 单独成组并进基础模块：Shizuku 的无线调试自启动靠它（ShizukuSetup），不能跟着可选的安卓打包模块走"
+}

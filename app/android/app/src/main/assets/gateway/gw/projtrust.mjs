@@ -1,0 +1,159 @@
+// 项目自带的「会自动运行的配置」：网关用 -p 起 claude，-p 不弹工作区信任框，下面这些打开就跑（2.1.311 实测）——
+//   · 工作目录 .claude/settings.json、settings.local.json 里的 hooks、env、各种 *Helper、插件、MCP 开关……
+//   · 工作目录以及每一级上级目录的 .mcp.json（claude 会一路往上找；/sdcard/.mcp.json 任何有存储权限的应用都能放）
+//   · 工作目录 .claude/agents、.claude/skills 里 frontmatter 带 hooks 的
+//   · 工作目录 .claude/output-styles 里的风格（选中就进系统提示）
+// 实测不加载的（不用扫）：上级目录的 .claude/settings*.json（git 根也不读）、--add-dir 目录里的 .mcp.json。
+// clone 下来的仓库、别的应用放进共享存储的文件都可能带这些。起一轮前先看一眼：有、又没被用户认过，就出一张卡片问；
+// 不同意（或者没人看着的定时任务）这一轮加 --setting-sources user，项目级的配置一概不加载，对话照常。
+// 认过的按工作目录记指纹，配置一变再问。用户自己的 ~/.claude 不在此列（那是用户级，本来就是他自己的）。
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { CFG, log } from "./config.mjs";
+import { isObj, loadState, saveState } from "./statefile.mjs";
+import { scanText } from "./breach.mjs";
+
+const MAX = 8 << 20;   // 超过的读不全：记成风险，指纹按大小 + 修改时间
+// 项目设置里不会让什么东西跑起来的键；其余的（含以后新加的）一律当风险报出来，宁可多问一次
+export const SAFE_KEYS = new Set(["$schema", "model", "outputStyle", "includeCoAuthoredBy", "includeGitInstructions", "cleanupPeriodDays",
+  "language", "alwaysThinkingEnabled", "spinnerTipsEnabled", "respectGitignore", "theme", "verbose", "attribution", "effortLevel"]);
+// disableAllHooks 不在里面：项目级的这一项连 --settings 挂的 guard 钩子一起关掉（2.1.311 实测，DeepSeek 复核 11-03 C-3）
+
+/** 风险文件的内容过破甲检查（红队 11-07 通道 E）：命中把摘录与行号附到风险串上。
+ *  只展示、不自动拒绝——用户自己的破甲仓库也命中，信任权还是用户的；单弱不亮（不然满卡片都是讨论笔记） */
+const breachNote = (raw) => {
+  const r = scanText(raw);
+  if (!r.blocked) return "";
+  const h = r.hits.find((x) => x.strong) || r.hits[0];
+  return h ? ` ｜ 破甲特征命中 L${h.line}: ${h.excerpt.slice(0, 60)}` : " ｜ 破甲特征命中";
+};
+
+// 与 saferead.mjs / components.mjs 的 readSmall 同口径（MIG-33）：stat 只取元数据，
+// 再 O_NOFOLLOW 打开、fstat 复核同一 inode，才从 fd 读内容。
+function readSmall(f) {
+  let st; try { st = fs.statSync(f); } catch { return null; }
+  if (!st.isFile()) return null;
+  if (st.size > MAX) return { raw: null, big: `${st.size}:${st.mtimeMs}` };
+  let fd = -1;
+  try {
+    fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const fst = fs.fstatSync(fd);
+    if (!fst.isFile() || fst.dev !== st.dev || fst.ino !== st.ino) return null;
+    if (fst.size > MAX) return { raw: null, big: `${fst.size}:${fst.mtimeMs}` };
+    const buf = Buffer.alloc(fst.size);
+    let off = 0;
+    while (off < buf.length) { const n = fs.readSync(fd, buf, off, buf.length - off, off); if (!n) break; off += n; }
+    return { raw: buf.subarray(0, off).toString("utf8") };
+  } catch { return null; }
+  finally { if (fd >= 0) try { fs.closeSync(fd); } catch {} }
+}
+
+function settingsRisks(file, raw, out) {
+  let j; try { j = JSON.parse(raw); } catch { if (raw.trim()) out.push(`${file}: ?`); return; }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return;
+  const n0 = out.length;
+  for (const [k, v] of Object.entries(j)) {
+    if (SAFE_KEYS.has(k)) continue;
+    if (k === "permissions" && v && typeof v === "object") {
+      for (const [pk, pv] of Object.entries(v)) {
+        if ((pk === "deny" || pk === "ask") || (pk === "allow" && Array.isArray(pv) && !pv.length)) continue;
+        out.push(`${file}: permissions.${pk}`);
+      }
+      continue;
+    }
+    out.push(`${file}: ${k}`);
+  }
+  if (out.length > n0) { const n = breachNote(raw); if (n) out.push(file + n); }
+}
+
+/** frontmatter 里出现 hooks 字样就算（引号键、缩进写法都不细分；宁可多问一次） */
+function hasFrontHooks(raw) {
+  const m = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---/.exec(raw);
+  return !!m && /hooks/i.test(m[1]);
+}
+
+/** 这个工作目录带了哪些会自动运行的配置。没有返回 null；有就给 { fp, risks }，fp 盖住所有看过的文件，任何一处改了都会变 */
+export function projectRisks(cwd) {
+  if (!cwd) return null;
+  const risks = [], h = crypto.createHash("sha256");
+  const take = (f, r) => { h.update(f + "\0" + (r.raw ?? "<big:" + r.big + ">") + "\0"); };
+  for (const n of ["settings.json", "settings.local.json"]) {
+    const f = path.join(cwd, ".claude", n), r = readSmall(f);
+    if (!r) continue;
+    take(f, r);
+    if (r.big) risks.push(`${f}: ?`); else settingsRisks(path.join(".claude", n), r.raw, risks);
+  }
+  for (let d = path.resolve(cwd), seen = 0; seen < 64; seen++) {
+    const f = path.join(d, ".mcp.json"), r = readSmall(f);
+    if (r) {
+      take(f, r);
+      let names = null;
+      try { const s = JSON.parse(r.raw).mcpServers; if (s && typeof s === "object") names = Object.keys(s); } catch {}
+      if (names) {
+        for (const k of names.slice(0, 20)) risks.push(`${f}: ${k}`);
+        if (r.raw) { const n = breachNote(r.raw); if (n) risks.push(f + n); }
+      } else if (r.big || r.raw.trim()) risks.push(`${f}: ?`);
+    }
+    const up = path.dirname(d);
+    if (up === d) break;
+    d = up;
+  }
+  let n = 0;
+  for (const sub of ["agents", "skills", "commands"]) {
+    const base = path.join(cwd, ".claude", sub);
+    let ents; try { ents = fs.readdirSync(base, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      if (++n > 300) { risks.push(`${path.join(".claude", sub)}: > 300`); break; }
+      const f = sub === "skills" ? path.join(base, e.name, "SKILL.md") : (e.name.endsWith(".md") ? path.join(base, e.name) : null);
+      const r = f && readSmall(f);
+      if (!r || (!r.big && !hasFrontHooks(r.raw))) continue;
+      take(f, r);
+      risks.push(`${path.join(".claude", sub, sub === "skills" ? e.name + "/SKILL.md" : e.name)}: ${r.big ? "?" : "hooks"}` + (r.big ? "" : breachNote(r.raw)));
+    }
+  }
+  // 项目自带的输出风格：选中（项目设置里的 outputStyle 就能选）就成了系统提示的一部分（输出风格目录的安全报告，11-04）
+  {
+    const base = path.join(cwd, ".claude", "output-styles");
+    let ents = []; try { ents = fs.readdirSync(base).filter((f) => f.endsWith(".md")).sort(); } catch {}
+    for (const f of ents.slice(0, 50)) {
+      const r = readSmall(path.join(base, f));
+      if (!r) continue;
+      take(path.join(base, f), r);
+      risks.push(`${path.join(".claude", "output-styles", f)}: output style` + (r.big ? "" : breachNote(r.raw)));
+    }
+  }
+  return risks.length ? { fp: h.digest("hex").slice(0, 32), risks: risks.length > 40 ? [...risks.slice(0, 39), `… +${risks.length - 39}`] : risks } : null;
+}
+
+// 认过的：{ 工作目录 realpath: { fp, at } }
+const TRUST_FILE = () => path.join(CFG.home, "ccapp-project-trust.json");
+const trustShape = (j) => {
+  if (!isObj(j)) return undefined;
+  const out = {};
+  for (const [k, v] of Object.entries(j)) if (isObj(v) && typeof v.fp === "string") out[k] = { fp: v.fp, at: Number.isFinite(+v.at) ? +v.at : 0 };
+  return out;
+};
+let TRUST = null;
+function trust() {
+  if (TRUST) return TRUST;
+  TRUST = loadState(TRUST_FILE(), { shape: trustShape, fallback: () => ({}) }).data;
+  TRUST = Object.assign(Object.create(null), TRUST);
+  return TRUST;
+}
+const keyOf = (cwd) => { try { return fs.realpathSync(cwd); } catch { return path.resolve(cwd); } };
+export const projectTrusted = (cwd, fp) => trust()[keyOf(cwd)]?.fp === fp;
+export function trustProject(cwd, fp) {
+  const t = trust();
+  t[keyOf(cwd)] = { fp, at: Date.now() };
+  const keys = Object.keys(t);
+  if (keys.length > 500) for (const k of keys.sort((a, b) => (t[a].at || 0) - (t[b].at || 0)).slice(0, keys.length - 500)) delete t[k];
+  if (!saveState(TRUST_FILE(), t)) log("[项目配置] 记不下：存储满了或没有权限");
+}
+/** 用户在应用里自己改了项目的钩子 / MCP（扩展页）：改完就认，别下一轮反过来问他自己写的东西 */
+export function retrustProject(cwd) {
+  const k = keyOf(cwd);
+  if (!trust()[k]) return;
+  const r = projectRisks(cwd);
+  if (r) trustProject(cwd, r.fp);
+}

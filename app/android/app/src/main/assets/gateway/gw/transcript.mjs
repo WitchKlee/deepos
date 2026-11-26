@@ -1,0 +1,416 @@
+import fs from "node:fs";
+import path from "node:path";
+import { LAST_LANG, tr, tz } from "./config.mjs";
+import { promptTokens } from "./stream.mjs";
+import { isInjected } from "./integrity.mjs";
+
+// ── 读会话记录：分页翻 transcript、子代理 ─────────────────────────────
+const MAX_ASSISTANT_TEXT = 200000;   // 单条回复最多交给前端这么多字（195-Q.10）
+
+/** 工具参数里的长字符串截短 —— 历史里一个 Write 工具能带几百 KB 的文件内容，
+ *  原样回传只会把界面拖死；摘要（command / file_path …）用不到那么长。 */
+function clipInput(v, depth = 0) {
+  if (typeof v === "string") return v.length > 2000 ? v.slice(0, 2000) + `…（共 ${v.length} 字）` : v;
+  if (!v || typeof v !== "object" || depth > 4) return v;
+  if (Array.isArray(v)) return v.slice(0, 50).map((x) => clipInput(x, depth + 1));
+  const o = {};
+  for (const k of Object.keys(v)) o[k] = clipInput(v[k], depth + 1);
+  return o;
+}
+
+/** 会话的子代理记录：<会话>/subagents/agent-*.meta.json 里的 toolUseId → 对应 agent-*.jsonl */
+export function agentFilesOf(sessionFile) {
+  const dir = path.join(sessionFile.replace(/\.jsonl$/, ""), "subagents"), m = new Map();
+  let names; try { names = fs.readdirSync(dir); } catch { return m; }
+  for (const n of names) {
+    if (!n.endsWith(".meta.json")) continue;
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8"));
+      const f = path.join(dir, n.replace(/\.meta\.json$/, ".jsonl"));
+      if (j.toolUseId && fs.existsSync(f)) m.set(String(j.toolUseId), f);
+    } catch {}
+  }
+  return m;
+}
+
+/** 单条记录里的数组元素坏了（null、数字、被改成对象）不能带崩整页：只认对象块 */
+const blocksOf = (c) => (Array.isArray(c) ? c.filter((x) => x && typeof x === "object") : []);
+
+/** transcript 的一行 → 0..n 条可渲染的消息 */
+export function transcriptItems(ev) {
+  const out = [];
+  if (!ev || ev.isSidechain || ev.isMeta) return out;
+  // 钩子往上下文里塞的话（SessionStart / UserPromptSubmit…）：界面折叠显示原文（实时那边见 stream.mjs 的 hookContext）
+  if (ev.type === "attachment" && ev.attachment?.type === "hook_additional_context") {
+    const c = ev.attachment.content, text = (Array.isArray(c) ? c.join("\n") : String(c ?? "")).slice(0, 20000);
+    if (text.trim()) out.push({ role: "hookctx", event: String(ev.attachment.hookEvent || ev.attachment.hookName || "").slice(0, 60), text });
+    return out;
+  }
+  if (ev.type === "user") {
+    // 压缩处：带上 uuid，界面画成章节分隔（第几章、题名由路由按脉络索引补上），脉络页跳转也靠它落地
+    if (ev.isCompactSummary) { out.push({ role: "note", text: tr(LAST_LANG, tz("（此前的对话已被压缩成摘要）")), compact: true, uuid: ev.uuid || null }); return out; }
+    const c = ev.message?.content;
+    if (typeof c === "string") {
+      if (c && !isInjected(c)) out.push({ role: "user", text: c, uuid: ev.uuid || null });
+    } else if (Array.isArray(c)) {
+      const blocks = blocksOf(c);
+      const texts = blocks.filter((x) => x.type === "text" && typeof x.text === "string" && x.text && !isInjected(x.text)).map((x) => x.text);
+      // 「图片随消息发」时原话里已有 @图片路径（含带空格引号形态），不再补一行 [图片]
+      if (blocks.some((x) => x.type === "image") && !texts.some((x) => /(?:@"\/[^"<>`\r\n]+\.(?:png|jpe?g|gif|webp)"|@\/\S+\.(?:png|jpe?g|gif|webp)\b)/i.test(x))) texts.push("[图片]");
+      if (texts.length) out.push({ role: "user", text: texts.join("\n"), uuid: ev.uuid || null });
+      for (const r of blocks) {
+        if (r.type !== "tool_result") continue;
+        let t = "";
+        if (typeof r.content === "string") t = r.content;
+        else if (Array.isArray(r.content)) t = r.content.map((x) => (x && x.type === "text" ? String(x.text ?? "") : `[${(x && x.type) || "?"}]`)).join("\n");
+        out.push({ role: "tool_result", id: r.tool_use_id, ok: !r.is_error, text: String(t).slice(0, 4000) });
+      }
+    }
+  } else if (ev.type === "assistant") {
+    // 接口报错落成的合成记录（isApiErrorMessage）：不是模型说的话，别混进正常回复里（OBS-005）
+    const apiErr = ev.isApiErrorMessage === true;
+    for (const c of blocksOf(ev.message?.content)) {
+      if (apiErr) {
+        if (c.type === "text" && typeof c.text === "string" && c.text) out.push({ role: "note", text: (tr(LAST_LANG, tz("接口报错，不是正常回复：")) + "\n" + c.text).slice(0, 4000) });
+        continue;
+      }
+      if (c.type === "text" && typeof c.text === "string" && c.text) {
+        // 单条正文不设上限：重开大会话时整段 renderMd 会把界面卡死（195-Q.10）。留一个很大的顶，超出的标出来
+        const over = c.text.length > MAX_ASSISTANT_TEXT;
+        const text = over ? c.text.slice(0, MAX_ASSISTANT_TEXT) + "\n\n" + tr(LAST_LANG, tz("（正文太长，只显示前 {n} 字）", { n: MAX_ASSISTANT_TEXT })) : c.text;
+        out.push({ role: "assistant", text, uuid: ev.uuid || null, ...(over ? { truncated: true } : {}) });   // uuid：书签落点
+      }
+      else if (c.type === "thinking" && typeof c.thinking === "string" && c.thinking) out.push({ role: "thinking", text: c.thinking.slice(0, 60000) });
+      else if (c.type === "tool_use" && c.id && c.name) out.push({ role: "tool_use", id: c.id, name: c.name, input: clipInput(c.input) });
+    }
+  }
+  return out;
+}
+
+/** 倒着读时这一行能不能定下「当前上下文用量」：压缩边界（取压缩后的数，没有就是未知，不越过边界拿旧的）
+ *  或带用量的主会话回复。定得下返回 { n }（n 可能是 null），定不下返回 null */
+function contextOf(ev) {
+  if (ev.isSidechain || ev.isMeta) return null;
+  if (ev.type === "system" && ev.subtype === "compact_boundary") {
+    const m = ev.compactMetadata || ev.compact_metadata || {};
+    const post = m.postTokens ?? m.post_tokens;
+    return { n: Number.isFinite(post) && post >= 0 ? post : null };
+  }
+  if (ev.type === "assistant" && !ev.isApiErrorMessage && ev.message?.model !== "<synthetic>") {
+    const n = promptTokens(ev.message?.usage);
+    if (Number.isFinite(n) && n > 0) return { n };
+  }
+  return null;
+}
+
+/** 会话最新的上下文用量：从尾部倒着找第一行定得下的（正向读一页时页里没有，书签 / 上次读到打开要用，#89）。
+ *  最多扫 MAX_SCAN，找不到返回 null；与 readSessionPage 同口径用 carry[] 攒块、超 maxLine 直接丢弃该半行，避免 O(N^2) 拷贝 */
+export async function latestContextTokens(file, { maxLine = 16 << 20 } = {}) {
+  const CH = 256 * 1024, MAX_SCAN = 12 * 1024 * 1024, MAX_LINE = maxLine;
+  const fh = await fs.promises.open(file, "r");
+  try {
+    let pos = (await fh.stat()).size, scanned = 0;
+    let carry = [], carryLen = 0, carryOver = false;
+    while (pos > 0 && scanned < MAX_SCAN) {
+      const start = Math.max(0, pos - CH);
+      const chunk = Buffer.alloc(pos - start);
+      await fh.read(chunk, 0, chunk.length, start);
+      pos = start; scanned += chunk.length;
+      let end = chunk.length;
+      for (;;) {
+        const searchFrom = (carry.length || carryOver) ? end - 1 : end - 2;
+        const nl = searchFrom >= 0 ? chunk.lastIndexOf(10, searchFrom) : -1;
+        if (nl < 0) {
+          if (start > 0) {
+            if (!carryOver) {
+              carry.push(Buffer.from(chunk.subarray(0, end)));
+              carryLen += end;
+              if (carryLen > MAX_LINE) { carry = []; carryLen = 0; carryOver = true; }
+            }
+            break;
+          }
+          let line = "";
+          if (!carryOver && end + carryLen <= MAX_LINE) {
+            const parts = carry.length ? [chunk.subarray(0, end), ...carry.slice().reverse()] : [chunk.subarray(0, end)];
+            line = Buffer.concat(parts).toString("utf8").trim();
+          }
+          carry = []; carryLen = 0; carryOver = false;
+          if (line) {
+            let ev = null; try { ev = JSON.parse(line); } catch {}
+            const c = ev && contextOf(ev);
+            if (c) return c.n;
+          }
+          break;
+        }
+        const seg = chunk.subarray(nl + 1, end);
+        let line = "";
+        if (!carryOver && seg.length + carryLen <= MAX_LINE) {
+          line = carry.length ? Buffer.concat([seg, ...carry.slice().reverse()]).toString("utf8").trim() : seg.toString("utf8").trim();
+        }
+        carry = []; carryLen = 0; carryOver = false;
+        if (line) {
+          let ev = null; try { ev = JSON.parse(line); } catch {}
+          const c = ev && contextOf(ev);
+          if (c) return c.n;
+        }
+        end = nl;
+        if (end === 0) break;
+      }
+    }
+    return null;
+  } finally {
+    await fh.close();
+  }
+}
+
+/** 从 transcript **尾部倒着**读一页消息。
+ *
+ *  老办法是 readFileSync 整个文件再全量解析 —— 十几 MB 的会话会把网关的事件循环
+ *  同步卡住好几秒，期间所有请求（包括正在推流的 SSE）一起排队，这就是"一恢复会话就卡半天"。
+ *  现在：异步、按 256KB 块往回读，凑够 limit 条且停在一轮对话的开头（用户消息）就收手。
+ *  cursor = 这一页最早那行的字节偏移，下次带 before=cursor 接着往前翻；0 表示到头了。
+ *
+ *  excludeFrom：正在生成的那一轮由事件总线实时推，这里按时间戳把它剔掉，免得画两遍。
+ *  pick(ev)：一行转成哪些条目，默认 transcriptItems（子代理记录全是侧链，要自己转，#71） */
+export async function readSessionPage(file, { before = null, limit = 40, excludeFrom = 0, pick = transcriptItems, maxLine = 64 << 20 } = {}) {
+  const CH = 256 * 1024, MAX_SCAN = 12 * 1024 * 1024, MAX_LINE = maxLine;
+  const fh = await fs.promises.open(file, "r");
+  try {
+    const size = (await fh.stat()).size;
+    let cursor = before == null ? size : Math.max(0, Math.min(Number(before) || 0, size));
+    let pos = cursor, scanned = 0;
+    const items = [];
+    let contextTokens = null, contextDone = false;
+    // 跨块的行按片段攒着，凑齐一行再 Buffer.concat：以前每个 256 KB 块都把整条未完成的行拼一遍，
+    // 20–64 MB 的单行会退化成平方级拷贝（195-Q.2）。carry 里是新→旧的片段。
+    // carryOver：这条行超过单行上限，整条不要（OBS-004：70 MB 单行反向读会吃几百 MB）
+    let carry = [], carryLen = 0, carryOver = false;
+
+    const handle = (line, at) => {
+      cursor = at;
+      let turnStart = false;
+      if (line) {
+        let ev = null; try { ev = JSON.parse(line); } catch {}
+        // exclude 只防止正文重复渲染，用量仍要从最新的主会话消息取。
+        if (ev && !contextDone) {
+          const c = contextOf(ev);
+          if (c) { contextDone = true; contextTokens = c.n; }
+        }
+        if (ev && !(excludeFrom && ev.timestamp && Date.parse(ev.timestamp) >= excludeFrom)) {
+          // 一行转不出来（记录坏了、pick 自己出错）只丢这一条，不能让整页历史 500（FIND-023）
+          let its = [];
+          try { const r = pick(ev); if (Array.isArray(r)) its = r; } catch {}
+          if (its.length) {
+            items.unshift(...its);
+            turnStart = its[0].role === "user";
+          }
+        }
+      }
+      if ((items.length >= limit && turnStart) || items.length >= limit * 4) {
+        return { items, cursor, size, contextTokens };
+      }
+      return null;
+    };
+
+    outer: while (pos > 0) {
+      const start = Math.max(0, pos - CH);
+      const chunk = Buffer.alloc(pos - start);
+      await fh.read(chunk, 0, chunk.length, start);
+      pos = start;
+      scanned += chunk.length;
+      let end = chunk.length;   // 这一行在本块里的结尾（不含）
+
+      for (;;) {
+        const searchFrom = (carry.length || carryOver) ? end - 1 : end - 2;
+        const nl = searchFrom >= 0 ? chunk.lastIndexOf(10, searchFrom) : -1;
+        if (nl < 0) {
+          if (start > 0) {
+            // 整段都是某条跨块行的开头部分：先攒着（它是目前最旧的一段，放在 carry 末尾）
+            if (!carryOver) {
+              carry.push(Buffer.from(chunk.subarray(0, end)));
+              carryLen += end;
+              if (carryLen > MAX_LINE) { carry = []; carryLen = 0; carryOver = true; }
+            }
+            break;
+          }
+          // 文件头、且这一行没有换行：把攒下的片段拼成完整的一行；超上限的整条跳过
+          const over = carryOver;
+          const parts = carry.length ? [chunk.subarray(0, end), ...carry.slice().reverse()] : [chunk.subarray(0, end)];
+          carry = []; carryLen = 0; carryOver = false;
+          const ret = handle(over ? "" : Buffer.concat(parts).toString("utf8").trim(), 0);
+          if (ret) return ret;
+          break outer;
+        }
+        const seg = chunk.subarray(nl + 1, end);
+        let line = "";
+        if (!carryOver && seg.length + carryLen <= MAX_LINE)
+          line = carry.length ? Buffer.concat([seg, ...carry.slice().reverse()]).toString("utf8").trim() : seg.toString("utf8").trim();
+        carry = []; carryLen = 0; carryOver = false;
+        const ret = handle(line, start + nl + 1);
+        if (ret) return ret;
+        if (cursor === 0) break outer;
+        end = nl;
+        if (end === 0) break;
+      }
+      if (scanned >= MAX_SCAN && items.length) break;   // 极端大行：先交这一页，别无限往前扫
+    }
+    return { items, cursor: pos === 0 && !carry.length ? 0 : cursor, size, contextTokens };
+  } finally {
+    await fh.close();
+  }
+}
+
+/** 从字节位置 after **往后**读一页（脉络跳到某一章用）。
+ *  after 不在行首时先跳到下一行开头；凑够 limit 条后停在下一轮对话开头（用户消息）之前 —— 和往前翻一样，
+ *  页的边界都落在一轮的开头。一轮里工具调用太多时到 limit*4 就在行边界收页，这时一次调用和它的结果可能分在两页（结果由前端待贴表补上）。
+ *  返回 { items, from, next, size }：from 是这一页第一行的偏移（往前翻用 before=from），next 是下一页的起点；next === size 表示到底了。
+ *  excludeFrom：时间戳不早于它的行不给（界面里正实时显示的那几轮）。 */
+export async function readSessionForward(file, { after = 0, limit = 40, excludeFrom = 0, maxLine = 64 << 20 } = {}) {
+  const CH = 256 * 1024, MAX_SCAN = 12 * 1024 * 1024, MAX_LINE = maxLine;
+  const fh = await fs.promises.open(file, "r");
+  try {
+    const size = (await fh.stat()).size;
+    let pos = Math.max(0, Math.min(Number(after) || 0, size));
+    // 对齐到行首：前一个字节不是换行就往后找下一行
+    if (pos > 0) {
+      const b = Buffer.alloc(1); await fh.read(b, 0, 1, pos - 1);
+      if (b[0] !== 10) {
+        for (let p = pos; p < size;) {
+          const chunk = Buffer.alloc(Math.min(CH, size - p)); await fh.read(chunk, 0, chunk.length, p);
+          const i = chunk.indexOf(10);
+          if (i >= 0) { pos = p + i + 1; break; }
+          p += chunk.length; if (p >= size) pos = size;
+        }
+      }
+    }
+    const from = pos, items = [];
+    // 用 carry[] 攒块、遇 \n 才一次性合并，避免超长单行退化成 O(N^2) 拷贝；超 MAX_LINE 后进入 dropping 状态直到下一个 \n
+    let carry = [], carryLen = 0, dropping = false, scanned = 0, lineBase = pos;
+    while (pos < size) {
+      const chunkOff = pos;
+      const chunk = Buffer.alloc(Math.min(CH, size - pos)); await fh.read(chunk, 0, chunk.length, pos);
+      pos += chunk.length; scanned += chunk.length;
+      let start = 0;
+      while (start < chunk.length) {
+        const nl = chunk.indexOf(10, start);
+        if (nl === -1) {
+          const seg = chunk.subarray(start);
+          if (!dropping) {
+            if (!carry.length) lineBase = chunkOff + start;
+            if (carryLen + seg.length > MAX_LINE) {
+              carry = []; carryLen = 0; dropping = true;
+            } else {
+              carry.push(Buffer.from(seg)); carryLen += seg.length;
+            }
+          }
+          break;
+        }
+        const seg = chunk.subarray(start, nl);
+        const lineAt = (carry.length || dropping) ? lineBase : chunkOff + start;
+        start = nl + 1;
+        if (dropping) {
+          dropping = false; carry = []; carryLen = 0; lineBase = chunkOff + start;
+          continue;
+        }
+        let line = "";
+        if (carryLen + seg.length <= MAX_LINE) {
+          line = (carry.length ? Buffer.concat([...carry, seg]) : seg).toString("utf8").trim();
+        }
+        carry = []; carryLen = 0; lineBase = chunkOff + start;
+        if (!line) continue;
+        let ev = null; try { ev = JSON.parse(line); } catch {}
+        if (!ev || (excludeFrom && ev.timestamp && Date.parse(ev.timestamp) >= excludeFrom)) continue;
+        // 单条转换出错只丢这一行（FIND-023）
+        let its = [];
+        try { its = transcriptItems(ev); } catch {}
+        if (!its.length) continue;
+        // 够数了、又碰到下一轮的开头：这一行留给下一页
+        if (items.length >= limit && its[0].role === "user" && lineAt > from) return { items, from, next: lineAt, size };
+        // 一轮里工具调用成百上千、中间没有下一条用户正文：和往前翻一样封顶 limit*4，不然一页能吞下整轮（#70）
+        if (items.length >= limit * 4 && lineAt > from) return { items, from, next: lineAt, size };
+        items.push(...its);
+      }
+      if (scanned >= MAX_SCAN && items.length) return { items, from, next: (carry.length || dropping) ? lineBase : pos, size };
+    }
+    // 最后一行没换行：是完整的 JSON 就照样算（导入的、被打断的记录末行常不带换行，#98 03-009）；
+    // 解析不了就是还在写，当作到底了 —— 再往后的内容走事件总线实时来，不然界面会反复来要一页空的。
+    // 正在跑的那一轮的行由 excludeFrom 挡掉，不会和实时来的重复
+    const tail = !dropping && carry.length ? Buffer.concat(carry).toString("utf8").trim() : "";
+    if (tail && items.length < limit * 4) {
+      let ev = null; try { ev = JSON.parse(tail); } catch {}
+      if (ev && !(excludeFrom && ev.timestamp && Date.parse(ev.timestamp) >= excludeFrom)) {
+        try { items.push(...transcriptItems(ev)); } catch {}   // 末行坏了只丢这一条（FIND-023）
+      }
+    }
+    return { items, from, next: size, size };
+  } finally {
+    await fh.close();
+  }
+}
+
+/** 找含某个 uuid 的那一行的起点（脉络跳转的兜底：索引里的偏移对不上时，比如文件被删消息改写过）。找不到返回 -1
+ *  start：从这个行首往后找（书签带着它所在那一页的起点，大会话不用从头扫） */
+export async function findLineOffset(file, uuid, start = 0) {
+  const needle = Buffer.from(`"uuid":"${uuid}"`), CH = 4 << 20;
+  const fh = await fs.promises.open(file, "r");
+  try {
+    const size = (await fh.stat()).size;
+    let pos = Math.max(0, Math.min(Number(start) || 0, size)), carry = Buffer.alloc(0), base = pos;
+    while (pos < size) {
+      const chunk = Buffer.alloc(Math.min(CH, size - pos)); await fh.read(chunk, 0, chunk.length, pos);
+      pos += chunk.length;
+      const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+      const i = data.indexOf(needle);
+      // data 总是从某一行的开头起（carry 留的是最后一个换行之后），所以找到时往回找换行就是行首
+      if (i >= 0) return base + data.lastIndexOf(10, i) + 1;
+      let keep = data.lastIndexOf(10) + 1;
+      if (data.length - keep > 64 << 20) keep = data.length - needle.length;   // 单行超长：只留够跨块匹配的一截
+      base += keep; carry = Buffer.from(data.subarray(keep));
+    }
+    return await findLineLoose(fh, size, uuid, Math.max(0, Math.min(Number(start) || 0, size)));
+  } finally { await fh.close(); }
+}
+/** 慢路：旧的 / 外部写的 jsonl 冒号后面带空格（"uuid": "…"），紧凑写法的字面量找不到（#98 03-008）。
+ *  逐行看：含这个 uuid 的行再按 "uuid" 键核一遍（parentUuid、leafUuid 也含它，不算） */
+async function findLineLoose(fh, size, uuid, pos) {
+  if (!/^[\w-]{1,100}$/.test(uuid)) return -1;
+  const CH = 4 << 20, val = Buffer.from(uuid), key = new RegExp(`"uuid"\\s*:\\s*"${uuid}"`);
+  let carry = Buffer.alloc(0), base = pos;
+  while (pos < size) {
+    const chunk = Buffer.alloc(Math.min(CH, size - pos)); await fh.read(chunk, 0, chunk.length, pos);
+    pos += chunk.length;
+    const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    let st = 0, hit = data.indexOf(val);
+    while (hit >= 0) {                              // 只看含 uuid 的那几行；一块里没有就整块跳过
+      st = data.lastIndexOf(10, hit) + 1;
+      let nl = data.indexOf(10, hit);
+      if (nl === -1) { if (pos >= size) nl = data.length; else break; }   // 文件最后一行可能没有换行；否则等下一块凑齐
+      if (key.test(data.toString("utf8", st, nl))) return base + st;
+      st = nl + 1; hit = data.indexOf(val, st);
+    }
+    if (hit < 0) st = Math.max(st, data.lastIndexOf(10) + 1);
+    st = Math.min(st, data.length);
+    if (data.length - st > 64 << 20) return -1;    // 单行超长还没完：这条路不管了
+    base += st; carry = Buffer.from(data.subarray(st));
+  }
+  return -1;
+}
+/** 偏移 off 是不是某行的行首、且那一行含这个 uuid（核对索引给的偏移还准不准）。
+ *  uuid 在行里排在 message 后面，压缩摘要那行常有十几 KB，所以要读完整行再看 */
+export async function lineHas(file, off, uuid) {
+  const fh = await fs.promises.open(file, "r");
+  try {
+    if (off > 0) { const p = Buffer.alloc(1); await fh.read(p, 0, 1, off - 1); if (p[0] !== 10) return false; }
+    const needle = `"uuid":"${uuid}"`, CH = 256 << 10;
+    let pos = off, line = Buffer.alloc(0);
+    while (line.length < 64 << 20) {
+      const b = Buffer.alloc(CH); const { bytesRead } = await fh.read(b, 0, CH, pos);
+      if (!bytesRead) break;
+      const nl = b.subarray(0, bytesRead).indexOf(10);
+      line = Buffer.concat([line, b.subarray(0, nl >= 0 ? nl : bytesRead)]);
+      if (nl >= 0) break;
+      pos += bytesRead;
+    }
+    return line.includes(needle) || (/^[\w-]{1,100}$/.test(uuid) && new RegExp(`"uuid"\\s*:\\s*"${uuid}"`).test(line.toString("utf8")));   // 冒号后带空格的旧格式（#98 03-008）
+  } catch { return false; } finally { await fh.close(); }
+}

@@ -1,40 +1,99 @@
-name: DeepOS Android CI
+name: DeepOS CI & Auto APK Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 jobs:
-  dart-and-flutter:
-    name: Analyze & Test
+  verify:
+    name: Gateway, Dart Client & Flutter Checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Analyze & test dsh_client
-        working-directory: packages/dsh_client
+      - name: Run local gateway backend tests
+        run: |
+          node tooling/test-gateway.mjs a0610-b2-sessionops ccmem.test a0610-b2-state-shapes a0610-b2-transcript-search a0610-b3-records-atomic
+
+      - name: Analyze & test cc_gateway_client (including live gateway interop)
+        working-directory: packages/cc_gateway_client
         run: |
           dart pub get
           dart analyze
           dart test
 
-      - name: Analyze & test dsh_remote
-        working-directory: packages/dsh_remote
+      - name: Verify l10n ARB parts sync
         run: |
-          dart pub get
-          dart analyze
-          dart test
+          python3 app/tool/l10n_merge.py --check
 
-      - name: Analyze Flutter app
+      - name: Analyze & test Flutter app
         working-directory: app
         run: |
           flutter pub get
           flutter analyze lib/
+          flutter test
+
+  build-apk:
+    name: Auto Build APKs (sdk28 + sdk36)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Android NDK & CMake for native C shims
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1"
+
+      - name: Build sdk28 & sdk36 Release APKs
+        working-directory: app
+        env:
+          DSH_MAVEN_MIRRORS: '0'
+        run: |
+          flutter pub get
+          flutter build apk --release --flavor sdk28 --target-platform android-arm64 --android-skip-build-dependency-validation
+          flutter build apk --release --flavor sdk36 --target-platform android-arm64 --android-skip-build-dependency-validation
+
+      - name: Verify APK native libs & compliance
+        run: |
+          mkdir -p dist
+          cp app/build/app/outputs/flutter-apk/app-sdk28-release.apk dist/DeepOS-sdk28.apk
+          cp app/build/app/outputs/flutter-apk/app-sdk36-release.apk dist/DeepOS-sdk36.apk
+          python3 tooling/check_apk_jni.py dist/DeepOS-sdk28.apk dist/DeepOS-sdk36.apk
+          (cd dist && sha256sum DeepOS-sdk28.apk DeepOS-sdk36.apk > SHA256SUMS)
+          ls -lh dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepOS-APKs-${{ github.run_number }}
+          path: dist/
+          retention-days: 30

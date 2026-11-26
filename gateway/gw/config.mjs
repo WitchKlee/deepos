@@ -1,0 +1,175 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import vm from "node:vm";
+
+// 测试绕过 scripts/test.mjs 直接跑（node --test / node xx.test.mjs）时环境里是真 home：
+// 一导入网关模块就会读写真的会话、运行标记、定时任务。没有 CCAPP_TEST 一律不让起（#49 P2-18）
+if ((process.env.NODE_TEST_CONTEXT || /\.test\.mjs$/.test(process.argv[1] || "")) && process.env.CCAPP_TEST !== "1")
+  throw new Error("测试请用 node scripts/test.mjs 跑（它会建临时 home 和工作区）；直接跑会动真数据");
+
+// 网关目录（gw/ 的上一级）：web/、bin/、TAG 等都相对它找
+export const HERE = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+/** OpenPGP 验签模块：打包时拷进 app/bin；仓库里（开发布局、测试）在 devkit/。找不到就抛错，调用方不许放行 */
+export async function loadPgp() {
+  for (const f of [path.join(HERE, "bin", "pgp.mjs"), path.join(HERE, "..", "devkit", "pgp.mjs")]) if (fs.existsSync(f)) return import(f);
+  throw new Error("pgp.mjs not found");
+}
+// ── 路径与配置 ────────────────────────────────────────────────────────
+export const CFG = {
+  runtime: process.env.CCAPP_RUNTIME || path.join(HERE, "..", "runtime"),
+  home: process.env.CCAPP_HOME || process.env.HOME || HERE,
+  workspace: process.env.CCAPP_WORKSPACE || path.join(HERE, "..", "workspace"),
+  port: Number(process.argv[2] || process.env.CCAPP_PORT || 8790),
+  bridgePort: Number(process.env.CCAPP_BRIDGE_PORT || 8788),
+  upstream: process.env.CCAPP_UPSTREAM || "https://api.deepseek.com/anthropic",
+  model: process.env.CCAPP_MODEL || "deepseek-flash",
+};
+
+// 前缀布局（cccodroid）：工具链是原生 Termux 前缀，claude 是官方原版二进制，
+// 由宿主 App 用环境变量告诉我们位置；没设就按旧布局（runtime/ 下）找。
+export const PREFIX = process.env.CCAPP_PREFIX || "";
+export const NO_BRIDGE = !!PREFIX || process.env.CCAPP_NO_BRIDGE === "1";
+export const PATHS = {
+  loader: process.env.CCAPP_LOADER || path.join(CFG.runtime, "glibc", "lib", "ld-linux-aarch64.so.1"),
+  glibcLib: process.env.CCAPP_GLIBC_LIB || path.join(CFG.runtime, "glibc", "lib"),
+  // 网关起 claude 用自己那份 glibc（files/gw/glibc，安全 4 第 2 层，GwRuntime.java；起之前 gwpin.mjs 按钉子再核）。
+  // 只给起 claude 的地方用：写进持久脚本的路径（custom.mjs 等）仍用上面两个，那些脚本在终端里跑、要跟着工具包走
+  claudeLoader: process.env.CCAPP_GW_LOADER || process.env.CCAPP_LOADER || path.join(CFG.runtime, "glibc", "lib", "ld-linux-aarch64.so.1"),
+  claudeLib: process.env.CCAPP_GW_GLIBC_LIB || process.env.CCAPP_GLIBC_LIB || path.join(CFG.runtime, "glibc", "lib"),
+  claude: process.env.CCAPP_CLAUDE || path.join(CFG.runtime, "claude"),
+  // cccodroid：给 claude 预加载的小库，把被安卓 seccomp 拦下的调用改成返回 ENOSYS
+  // （Android 14 拦 epoll_pwait2，claude 不挂它一启动就被 SIGSYS 打死）
+  preload: process.env.CCAPP_CLAUDE_PRELOAD || "",
+  node: path.join(CFG.runtime, "node", "node"),
+  nodeLib: path.join(CFG.runtime, "node", "lib"),
+  web: path.join(HERE, "web"),
+  toolchain: process.env.CCAPP_TOOLCHAIN || path.join(CFG.home, "..", "toolchain"),
+  bridge: path.join(HERE, "localbridge.mjs"),
+  config: path.join(CFG.home, "ccapp-config.json"),
+  settings: path.join(CFG.home, "ccapp-settings.json"),
+  names: path.join(CFG.home, "ccapp-session-names.json"),
+  windows: path.join(CFG.home, "ccapp-model-windows.json"),
+  projects: path.join(CFG.home, ".claude", "projects"),
+};
+
+// 给 glibc 程序 --preload 的库（冒号分隔）。经加载器时 Env.java 给的是 seccomp-enosys.so + exec-shim.so
+export const GLIBC_PRELOAD = process.env.CCAPP_GLIBC_PRELOAD || (PATHS.preload && fs.existsSync(PATHS.preload) ? PATHS.preload : "");
+/** glibc 进程的环境：摘掉 LD_PRELOAD —— 经加载器时网关环境里挂着 termux-exec（bionic 库），glibc 的 ld.so 读到直接报 invalid ELF header */
+export function glibcEnv(env = process.env) {
+  const e = { ...env };
+  delete e.LD_PRELOAD;
+  delete e.CCAPP_SELF_EXE;      // exec-shim 用它冒充 /proc/self/exe：网关直接拉的 glibc 程序不是它记的那个
+  return e;
+}
+
+// ── 测试模式 ──────────────────────────────────────────────────────────
+// CCAPP_TEST=1（tests/ 里的测试设的）：模块被导入时不做任何启动动作——不恢复中断记录、不装技能、不起定时器、
+// 不写 gateway.log。网关真跑起来时这个开关是关的，一切照旧。测试同时把 CCAPP_HOME 指到临时目录，双保险
+export const LIVE = process.env.CCAPP_TEST !== "1";
+
+// ── 工具函数 ──────────────────────────────────────────────────────────
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 日志时间带日期、用设备本地时区（sched.mjs 启动时按 persist.sys.timezone 设 TZ）：只有时分秒的话，
+// 诊断包跨天/跨时区就分不清先后（FIND-047）。本地时间比 ISO 的 UTC 更贴近用户看到的时刻。
+const pad2 = (n) => String(n).padStart(2, "0");
+export const logTime = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; };
+// 默认落 home（私有目录），不落共享存储：脱离 App 单独跑网关时别让别的应用读到日志（审查 v0.5.4 B-L2）
+const LOG_FILE = process.env.CCAPP_LOG || path.join(CFG.home, "gateway.log");
+// 网址里的账号口令（http://user:pass@host）和查询串里的令牌（?key=…、&token=…）不进日志（后者审查 10-29 第六份 低3）
+export const noCred = (s) => s.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\/\s@]+@/gi, "$1***@")
+  .replace(/([?&](?:key|api_?key|token|access_token|auth|sig|signature|password|secret)=)[^&\s"']+/gi, "$1***")
+  // 长得像密钥的串：claude 的 stderr、厂商报错原文都会进日志（审查 10-30 第九份 后端低7）
+  .replace(/\b(sk-(?:ant-)?[A-Za-z0-9_-]{4})[A-Za-z0-9_-]{8,}/g, "$1***")
+  .replace(/\b(gh[pousr]_)[A-Za-z0-9]{8,}/g, "$1***")
+  // 其他常见前缀：MiMo Token Plan（tp-）、xAI、Hugging Face、GitLab、Google（审查 v0513b 低-2）
+  .replace(/\b(tp-|xai-|hf_|glpat-|AIza)([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{8,}/g, "$1$2***")
+  // 智谱 GLM 这类「id.secret」：点两边都是长串、左边带数字
+  .replace(/\b((?=[A-Za-z]*\d)[A-Za-z0-9]{4})[A-Za-z0-9]{2,}\.[A-Za-z0-9]{10,}\b/g, "$1***")
+  .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]{8,}=*/gi, "$1***")
+  .replace(/(x-api-key["']?\s*[:=]\s*["']?)[^\s"',}]{8,}/gi, "$1***");
+// 日志有上限（审查 10-30 第九份 高3）：超过 4 MB 挪成 gateway.log.1（只留一份旧的），单行截到 4000 字，
+// 别让反复请求把私有目录写满
+const LOG_MAX = 4 << 20;
+let logSize = -1;
+export const log = (...a) => {
+  let line = noCred(`[${logTime()}] ${a.join(" ")}`);
+  if (!LIVE) return;
+  if (line.length > 4000) line = line.slice(0, 4000) + " …";
+  console.log(line);
+  try {
+    if (logSize < 0) logSize = fs.existsSync(LOG_FILE) ? fs.statSync(LOG_FILE).size : 0;
+    if (logSize > LOG_MAX) { fs.renameSync(LOG_FILE, LOG_FILE + ".1"); logSize = 0; }
+    fs.appendFileSync(LOG_FILE, line + "\n");
+    logSize += Buffer.byteLength(line) + 1;
+  } catch {}
+};
+
+// ── 提示语的多语言 ────────────────────────────────────────────────────
+// 源语言是中文、键就是中文原句，和界面共用 web/lang-*.js 的词典（回退：当前语言 → 英文 → 中文）。
+// 要翻的提示语用 tz 包起来（第一个参数是带 {name} 占位的中文原句，第二个是变量）：它就是一个照常能拼接、能当 Error 消息的字符串，
+// 同时登记「拼好的中文 → 键和变量」。所以提示语哪怕先变成 e.message、再转几手，
+// sendJson 出门时（按请求头 X-CC-Lang）或推送时（按最近一次见到的语言）都还能认出来翻。
+// gateway.log 不翻。新键照 i18n/HANDOFF.md 的流程进词典（scan.mjs 也扫这里 tz 包着的原句）
+const TZ_SEEN = new Map();                      // 拼好的中文 → [键, 变量]，只留最近 300 条
+const tzFill = (k, v) => (v ? k.replace(/\{(\w+)\}/g, (m, n) => (n in v ? String(v[n]) : m)) : k);
+export function tz(k, v) {
+  const s = tzFill(k, v);
+  TZ_SEEN.delete(s); TZ_SEEN.set(s, [k, v || null]);
+  if (TZ_SEEN.size > 300) TZ_SEEN.delete(TZ_SEEN.keys().next().value);
+  return s;
+}
+const LANG_DICTS = new Map();
+export let LAST_LANG = "zh";
+// 词典是在网关进程里执行的脚本（复数形式是函数）：部署出来的（有 FILES）只执行按清单核过的字节，读法由 appfiles.mjs 挂进来；
+// 还没挂上就先不加载（不缓存，挂上后再读），对不上就不用这份词典、回退中文（0.6.9 审计 200-14-01：以前直接读盘执行，不在运行期完整性保护里）
+let LANG_READ = null;
+export function setLangReader(fn) { LANG_READ = fn; LANG_DICTS.clear(); }
+const DEPLOYED = fs.existsSync(path.join(HERE, "FILES"));
+function langDict(code) {
+  if (!/^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(code)) return null;
+  if (!LANG_DICTS.has(code)) {
+    const rel = `web/lang-${code}.js`;
+    if (DEPLOYED && !LANG_READ) return null;
+    let d = null;
+    try {
+      const buf = LANG_READ ? LANG_READ(rel) : fs.readFileSync(path.join(HERE, rel));
+      if (!buf) log(`⚠️ [应用文件] ${rel} 和安装包对不上，不用这份词典`);
+      else {
+        const sb = { window: {} };
+        vm.runInNewContext(buf.toString("utf8"), sb, { timeout: 2000 });
+        d = (sb.window.I18N_DICT || {})[code] || null;
+      }
+    } catch {}
+    LANG_DICTS.set(code, d);
+  }
+  return LANG_DICTS.get(code);
+}
+/** 请求带的界面语言；顺手记下来给推送和后台任务用 */
+export function reqLang(req) {
+  const l = String((req && req.headers && req.headers["x-cc-lang"]) || "");
+  if (/^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(l)) LAST_LANG = l;
+  return LAST_LANG;
+}
+export function tr(lang, msg) {
+  if (typeof msg !== "string" || !lang || lang === "zh") return msg;
+  const hit = TZ_SEEN.get(msg) || [msg, null];
+  for (const c of lang === "en" ? ["en"] : [lang, "en"]) {
+    const d = langDict(c), x = d && d[hit[0]];
+    if (x === undefined || x === null) continue;
+    try { return typeof x === "function" ? String(x(hit[1] || {})) : tzFill(String(x), hit[1]); } catch {}
+  }
+  return msg;
+}
+
+/** claude 认的权限模式（2026-10 版二进制）。没有 manual */
+export const PERM_MODES = ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"];
+/** 比「自动接受编辑」宽的模式。前端 03-perm-status.js 的 WIDE_MODES 是同一张表，改一处要同步另一处 */
+export const WIDE_PERM_MODES = ["bypassPermissions", "auto", "dontAsk"];
+/** 回答权限请求时顺带的模式怎么处理："global" 改全局、"run" 只把这一轮切回原模式、"none" 不动。
+ *  只有批准才切；最多到「自动接受编辑」可以改全局（计划卡上的明确选项）；宽模式只能原样保持本轮，放宽得走 /api/perm/mode 那条有确认的路 */
+export function permModeAction(behavior, mode, runPermMode) {
+  if (behavior !== "allow" || !mode || !PERM_MODES.includes(mode)) return "none";
+  if (!WIDE_PERM_MODES.includes(mode)) return "global";
+  return mode === runPermMode ? "run" : "none";
+}

@@ -1,0 +1,160 @@
+// 流式响应的背压：事件流补发（gw/bus.mjs，#187 #192）、streamfix 代理（gw/streamfix.mjs，#193）
+// 真实 node:http 回环；客户端用裸 socket，好控制「先不读、过一会再读」
+import "../gw/config.mjs";
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import net from "node:net";
+
+const { routeBus, publish, onPublish } = await import("../gw/bus.mjs");
+const { runEmit } = await import("../gw/queue.mjs");
+const { RUNS } = await import("../gw/runs.mjs");
+const { startStreamFix, fixedBaseUrl, STREAMFIX } = await import("../gw/streamfix.mjs");
+
+const servers = [];
+after(() => { RUNS.delete("a0610-sse"); for (const s of servers) { s.closeAllConnections?.(); s.close(); } STREAMFIX.server?.close(); });
+async function listen(handler) {
+  const s = http.createServer(handler); servers.push(s);
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  return s.address().port;
+}
+const busPort = await listen((req, res) => routeBus(req, res, new URL(req.url, "http://x"), "/api/events"));
+/** 连上事件流；pauseMs 内不读。返回 { got(): 已收到的文本, wait(pred, ms), sock } */
+function connect(port, path, pauseMs = 0) {
+  const sock = net.connect(port, "127.0.0.1", () => sock.write(`GET ${path} HTTP/1.1\r\nHost: x\r\n\r\n`));
+  let buf = "", closed = false;
+  sock.setEncoding("utf8");
+  sock.on("data", (d) => { buf += d; });
+  sock.on("close", () => { closed = true; });
+  if (pauseMs) { sock.pause(); setTimeout(() => sock.resume(), pauseMs); }
+  return {
+    sock, got: () => buf, closed: () => closed,
+    async wait(pred, ms = 15000) { const t = Date.now(); while (!pred(buf)) { if (Date.now() - t > ms || closed) return false; await new Promise((r) => setTimeout(r, 20)); } return true; },
+  };
+}
+
+test("#187：整轮重放全是中文增量 → 补发一路发到 sync，不卡在等 drain", async () => {
+  const log = [];
+  for (let i = 0; i < 1500; i++) log.push({ type: "delta", runId: "a0610-sse", text: "中".repeat(2000) });
+  RUNS.set("a0610-sse", { id: "a0610-sse", text: "", log, startedAt: Date.now(), perms: null });
+  const c = connect(busPort, "/api/events");
+  const ok = await c.wait((b) => b.includes('"type":"sync"'), 20000);
+  c.sock.destroy();
+  RUNS.delete("a0610-sse");
+  assert.ok(ok, `没等到 sync，只收到 ${c.got().length} 字符`);
+});
+
+test("#192：补发期间排了二十几 MB → 按对端速度写完，正常在读的连接不被当成慢读者断掉", async () => {
+  RUNS.set("a0610-sse", { id: "a0610-sse", text: "", log: Array.from({ length: 6 }, () => ({ type: "delta", runId: "a0610-sse", text: "x".repeat(6 << 20) })), startedAt: Date.now(), perms: null });
+  const c = connect(busPort, "/api/events", 600);
+  await new Promise((r) => setTimeout(r, 100));          // 补发在等对端收
+  const pad = "y".repeat(64 << 10);
+  for (let i = 0; i < 400; i++) publish({ type: "a0610q", i, pad });
+  // 一看到 sync 就再发一条：修之前此刻排着的二十几 MB 刚被一口气塞进响应缓冲，这一条会撞上 8MB 线把连接断掉
+  await c.wait((b) => b.includes('"type":"sync"'), 30000);
+  publish({ type: "a0610tail" });
+  const all = await c.wait((b) => b.includes('"i":399,'), 30000);
+  const tail = await c.wait((b) => b.includes('"type":"a0610tail"'), 10000);
+  const n = (c.got().match(/"type":"a0610q"/g) || []).length;
+  const closed = c.closed();
+  c.sock.destroy();
+  RUNS.delete("a0610-sse");
+  assert.ok(all && tail && !closed, `连接断了或没收全：排队项 ${n}/400，closed=${closed}`);
+  assert.equal(n, 400);
+});
+
+test("#193：streamfix 下游不读 → 停读上游，不把整条流吸进响应缓冲", async () => {
+  startStreamFix();
+  for (let i = 0; i < 100 && !STREAMFIX.port; i++) await new Promise((r) => setTimeout(r, 20));
+  const total = { sent: 0 };
+  const ev = (o) => `event: ${o.type}\ndata: ${JSON.stringify(o)}\n\n`;
+  const upPort = await listen(async (req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    const w = (s) => { total.sent += Buffer.byteLength(s); return res.write(Buffer.from(s)); };
+    w(ev({ type: "message_start", message: { id: "m", usage: { input_tokens: 1, output_tokens: 0 } } }));
+    w(ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+    const piece = ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "中".repeat(2700) } });
+    for (let i = 0; i < 12000; i++) {
+      if (res.destroyed) return;
+      if (!w(piece)) await new Promise((r) => { res.once("drain", r); res.once("close", r); });
+    }
+    w(ev({ type: "content_block_stop", index: 0 })); w(ev({ type: "message_stop" })); res.end();
+  });
+  const base = fixedBaseUrl(`http://127.0.0.1:${upPort}`);
+  const u = new URL(base);
+  const sock = net.connect(+u.port, "127.0.0.1", () => sock.write(`POST ${u.pathname}/v1/messages HTTP/1.1\r\nHost: x\r\ncontent-length: 2\r\n\r\n{}`));
+  sock.pause();                                          // 一直不读
+  await new Promise((r) => setTimeout(r, 1500));
+  const sent = total.sent;
+  sock.destroy();
+  // 一条流约 99MB；修之前下游不读也整条吸完，修之后只堆到两段回环的内核缓冲那么多。
+  // 这个上限跟设备有关：开发机约 11MB，这台 Android 的回环缓冲约 28MB，所以留到 64MB，
+  // 仍明显小于整条流——整条吸完的老问题照样会在这里失败。
+  assert.ok(sent < 64 << 20, `下游不读，上游却推出去了 ${sent} 字节`);
+});
+
+test("T.3：run.log 里的工具入参截短，实时推送照旧全文", async () => {
+  const run = { id: "a0610-t3", log: [], pend: null, ended: false, startedAt: Date.now() };
+  const big = "w".repeat(1 << 20);
+  let live = null;
+  const off = onPublish((ev) => { if (ev.type === "tool_use" && ev.id === "tu1") live = ev; });
+  runEmit(run, { type: "tool_use", id: "tu1", name: "Write", input: { file_path: "/x", content: big } });
+  runEmit(run, { type: "tool_use", id: "tu2", name: "Read", input: { file_path: "/y" } });
+  off();
+  assert.equal(live.input.content.length, big.length, "实时事件不截");
+  const [a, b] = run.log;
+  assert.ok(a.input.content.length < 70 << 10, `记录里还是 ${a.input.content.length} 字`);
+  assert.equal(a.inputCut, true); assert.equal(a.input.file_path, "/x");
+  assert.equal(b.inputCut, undefined); assert.deepEqual(b.input, { file_path: "/y" });
+});
+
+test("T.3：整轮重放边写边序列化；重放途中最后一条被续写，续上的只从队列来一次", async () => {
+  const log = [];
+  for (let i = 0; i < 5; i++) log.push({ type: "tool_result", runId: "a0610-sse", id: "r" + i, text: "z".repeat(4 << 20) }, { type: "phase", runId: "a0610-sse", i });
+  log.push({ type: "delta", runId: "a0610-sse", text: "甲" });
+  const run = { id: "a0610-sse", text: "", log, pend: null, ended: false, startedAt: Date.now(), perms: null };
+  RUNS.set("a0610-sse", run);
+  const c = connect(busPort, "/api/events", 600);
+  await new Promise((r) => setTimeout(r, 100));          // 补发还卡在前面几条大的上
+  runEmit(run, { type: "delta", text: "乙" });
+  await new Promise((r) => setTimeout(r, 80));           // 40ms 攒批后记进 log、推给队列
+  assert.equal(log[log.length - 1].text, "甲乙", "log 里就地续写了");
+  const ok = await c.wait((b) => b.includes('"text":"乙"'), 30000);
+  const got = c.got();
+  c.sock.destroy();
+  RUNS.delete("a0610-sse");
+  assert.ok(ok, "队列里的增量没到");
+  assert.equal((got.match(/"text":"甲"/g) || []).length, 1, "最后一条按连上那一刻的样子重放");
+  assert.equal((got.match(/甲乙/g) || []).length, 0, "续写的部分不能在重放里再出现一次");
+  assert.equal((got.match(/"type":"tool_result"/g) || []).length, 5);
+});
+
+test("#188：整轮重放带 focus → 正在看的会话先放，别的会话的轮照样都在、排后面", async () => {
+  RUNS.set("a0610-other", { id: "a0610-other", sessionId: "s-other", text: "", startedAt: 1, perms: null, log: [{ type: "run_start", runId: "a0610-other" }, { type: "delta", runId: "a0610-other", text: "o".repeat(1 << 20) }] });
+  RUNS.set("a0610-mine", { id: "a0610-mine", sessionId: "s-mine", text: "", startedAt: 2, perms: null, log: [{ type: "run_start", runId: "a0610-mine" }, { type: "delta", runId: "a0610-mine", text: "我的" }] });
+  try {
+    for (const [q, first] of [["?focus=s-mine", "a0610-mine"], ["?run=a0610-mine", "a0610-mine"], ["", "a0610-other"]]) {
+      const c = connect(busPort, "/api/events" + q);
+      const ok = await c.wait((b) => b.includes('"type":"sync"'), 20000);
+      const got = c.got(); c.sock.destroy();
+      assert.ok(ok, "没等到 sync");
+      const a = got.indexOf('"runId":"a0610-mine"'), b = got.indexOf('"runId":"a0610-other"');
+      assert.ok(a > 0 && b > 0, "两轮都要在");
+      assert.equal(a < b ? "a0610-mine" : "a0610-other", first, `参数 ${q || "（无）"}`);
+    }
+  } finally { RUNS.delete("a0610-other"); RUNS.delete("a0610-mine"); }
+});
+
+test("200-H-3：事件环按字节封顶，中文事件不会让 32MB 的环实际装下近百 MB", async () => {
+  const c0 = connect(busPort, "/api/events");
+  await c0.wait((b) => b.includes('"type":"sync"'));
+  const id = /id: ([0-9a-z]+\.\d+)\ndata: \{"type":"sync"\}/.exec(c0.got())[1];
+  c0.sock.destroy();
+  for (let i = 0; i < 12; i++) publish({ type: "a0610h3", i, text: "中".repeat(1 << 20) });   // 每条约 3MB 字节、1M 字符
+  const c = connect(busPort, "/api/events?since=" + id);
+  await c.wait((b) => b.includes('"type":"hello"'));
+  const hello = JSON.parse(/data: (\{"type":"hello".*?)\n\n/s.exec(c.got())[1]);
+  c.sock.destroy();
+  assert.equal(hello.resume, false, "36MB 的中文事件超过了 32MB 的环，最早的应当被挤掉");
+});

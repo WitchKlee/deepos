@@ -1,94 +1,77 @@
 #!/usr/bin/env python3
-"""Check JNI class definitions in the actual R8 output, not just DEX string references."""
+"""Verify DeepOS v2 (app.deepos) APK native libraries and compliance invariants."""
+from __future__ import annotations
 
-import argparse
-from pathlib import Path
-import re
-import struct
+import sys
 import zipfile
 
+REQUIRED_LIBS = (
+    "lib/arm64-v8a/libldlinux.so",
+    "lib/arm64-v8a/libcc7zz.so",
+    "lib/arm64-v8a/libccenosys.so",
+    "lib/arm64-v8a/libccenosysrun.so",
+    "lib/arm64-v8a/libccptyhost.so",
+    "lib/arm64-v8a/libccexecshim.so",
+    "lib/arm64-v8a/libccexecshimb.so",
+    "lib/arm64-v8a/libccrun.so",
+    "lib/arm64-v8a/libccnodump.so",
+)
 
-REQUIRED_CLASSES = {
-    "Lai/onnxruntime/OrtException;",
-    "Lai/onnxruntime/OrtSession;",
-    "Lai/onnxruntime/OnnxTensor;",
-    "Lai/onnxruntime/TensorInfo;",
-}
+REQUIRED_ASSETS = (
+    "assets/gateway/server.mjs",
+    "assets/devkit-pin.json",
+    "assets/claude-code/verified.json",
+    "assets/claude-code/verified.json.sig",
+)
 
-
-class ApkJniError(ValueError):
-    pass
-
-
-def dex_classes(data: bytes) -> set[str]:
-    """Read class_def -> type_id -> string_id for standard little-endian DEX files."""
-    if (len(data) < 112 or not re.fullmatch(rb"dex\n[0-9]{3}\x00", data[:8])
-            or struct.unpack_from("<III", data, 32) != (len(data), 112, 0x12345678)):
-        raise ApkJniError("Invalid or unsupported DEX header")
-
-    def table(offset: int, width: int) -> tuple[int, int]:
-        count, start = struct.unpack_from("<II", data, offset)
-        if count and (start < 112 or start + count * width > len(data)):
-            raise ApkJniError("DEX table extends outside the file")
-        return count, start
-
-    strings, string_ids = table(56, 4)
-    types, type_ids = table(64, 4)
-    classes, class_defs = table(96, 32)
-    result = set()
-    for i in range(classes):
-        type_id = struct.unpack_from("<I", data, class_defs + i * 32)[0]
-        if type_id >= types:
-            raise ApkJniError("Invalid DEX class type index")
-        string_id = struct.unpack_from("<I", data, type_ids + type_id * 4)[0]
-        if string_id >= strings:
-            raise ApkJniError("Invalid DEX descriptor string index")
-        pos = struct.unpack_from("<I", data, string_ids + string_id * 4)[0]
-        # A string_data_item starts with its UTF-16 length encoded as ULEB128.
-        for _ in range(5):
-            if pos >= len(data):
-                raise ApkJniError("Truncated DEX descriptor")
-            byte = data[pos]
-            pos += 1
-            if byte < 128:
-                break
-        else:
-            raise ApkJniError("Invalid DEX descriptor length")
-        try:
-            end = data.index(0, pos)
-        except ValueError as error:
-            raise ApkJniError("Unterminated DEX descriptor") from error
-        # Required JNI names are ASCII; do not need a full MUTF-8 decoder for other classes.
-        result.add(data[pos:end].decode("ascii", errors="replace"))
-    return result
+FORBIDDEN_SUBSTRINGS = (
+    "webrtc",
+    "onnx",
+    "sherpa",
+    "proot",
+    "tawcroot",
+    "mlkit",
+    "accessibility",
+    "assets/phone/",
+    "assets/speech/",
+)
 
 
-def check_apk_jni(path: Path) -> None:
-    defined = set()
-    try:
-        with zipfile.ZipFile(path) as apk:
-            dex_files = [name for name in apk.namelist() if re.fullmatch(r"classes(?:[2-9]|[1-9][0-9]+)?\.dex", name)]
-            if not dex_files:
-                raise ApkJniError("APK contains no classes*.dex")
-            for name in dex_files:
-                defined.update(dex_classes(apk.read(name)))
-    except (OSError, zipfile.BadZipFile) as error:
-        raise ApkJniError(f"Cannot inspect APK: {error}") from error
-    missing = REQUIRED_CLASSES - defined
-    if missing:
-        raise ApkJniError("APK is missing JNI class definitions (check R8 keep rules): " + ", ".join(sorted(missing)))
+def verify_apk(path: str) -> None:
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
 
+    missing_libs = [lib for lib in REQUIRED_LIBS if lib not in names]
+    if missing_libs:
+        raise SystemExit(f"FAIL [{path}]: missing required native libraries: {missing_libs}")
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("apk", type=Path)
-    args = parser.parse_args()
-    try:
-        check_apk_jni(args.apk)
-    except ApkJniError as error:
-        parser.exit(1, f"APK JNI check failed: {error}\n")
-    print("APK JNI class definitions preserved")
+    missing_assets = [asset for asset in REQUIRED_ASSETS if asset not in names]
+    if missing_assets:
+        raise SystemExit(f"FAIL [{path}]: missing required gateway assets: {missing_assets}")
+
+    forbidden = sorted(
+        n for n in names if any(tok in n.lower() for tok in FORBIDDEN_SUBSTRINGS)
+    )
+    if forbidden:
+        raise SystemExit(f"FAIL [{path}]: forbidden artifacts present: {forbidden[:10]}")
+
+    # Ensure Anthropic proprietary Claude Code ELF binary is never bundled inside the APK
+    # (the tiny /system/bin/sh launcher script at assets/gateway/bin/claude is allowed).
+    with zipfile.ZipFile(path) as zf:
+        large_claude = [
+            n for n in names
+            if (n.endswith("/claude") or n == "claude")
+            and (zf.getinfo(n).file_size > 1024 * 1024 or zf.read(n)[:4] == b"\x7fELF")
+        ]
+    if large_claude:
+        raise SystemExit(f"FAIL [{path}]: proprietary claude binary must not be bundled: {large_claude}")
+
+    arm64_libs = [n for n in names if n.startswith("lib/arm64-v8a/")]
+    print(f"OK [{path}]: {len(arm64_libs)} arm64 native libs verified, 0 forbidden artifacts.")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: check_apk_jni.py <apk_path> [<apk_path> ...]")
+    for apk in sys.argv[1:]:
+        verify_apk(apk)

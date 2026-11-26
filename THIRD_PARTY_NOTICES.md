@@ -9,7 +9,23 @@
 
 ## 一、复制或改写进源码的代码
 
-### Phase（MIT，作者授权）
+### cccodroid（Apache-2.0）
+
+| 项 | 内容 |
+|---|---|
+| 项目 | cccodroid，https://github.com/greyoak111/cccodroid |
+| 版权人 | Copyright 2026 greyoak111 and contributors |
+| 许可 | Apache License 2.0（与本仓库 AGPL-3.0 兼容合入） |
+| 用途 | 免 PRoot 本地 Claude Code HTTP+SSE 网关（`gateway/`）、模块化 Termux 工具包构建器（`devkit/`）、官方清单验签（`claude-code/`）及 Android 原生 C 垫片（`app/android/app/src/main/cpp/`） |
+
+附随运行时原生组件声明（保留自 `cccodroid/NOTICE`）：
+- **Claude Code**：Anthropic 专有软件，**不随本项目或 APK 分发**，由用户首次启动时从 Anthropic 官方渠道下载并原样运行。
+- **GNU C Library 2.44 dynamic loader**（LGPL-2.1-or-later）：随 APK 分发为 `lib/arm64-v8a/libldlinux.so`（已对 `/data/data/com.termux/` 执行 10 字符等长改写至 `/data/data/app.deepos/`），详见 `third_party/glibc/` 与 `devkit/archive-sources.mjs`。
+- **7-Zip 26.06**（LGPL-2.1-or-later，含 BSD 与 unRAR 限制）：随 APK 分发为 `lib/arm64-v8a/libcc7zz.so`，详见 `third_party/7zip/`。
+- **Shizuku-API 13.1.5**（MIT）：可选终端 `priv` / `cc-mem` 辅助，详见 `third_party/shizuku/LICENSE`。
+- **ccch1mneyyy/dsh-Go**（AGPL-3.0）：本仓库上游基础项目，保留完整 `LICENSE` 与原有声明。
+
+### Phase（MIT，历史记录，手机无障碍控屏已移除）
 
 | 项 | 内容 |
 |---|---|
